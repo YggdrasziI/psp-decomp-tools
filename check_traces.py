@@ -4,7 +4,7 @@ machine, attribution trailers, private words, and local files that must stay out
 of the repository.
 
 Checks, from the root of the git work tree:
-  python tools/psp/check_traces.py                  # tracked and staged files
+  python tools/psp/check_traces.py                  # files of the index (next commit)
   python tools/psp/check_traces.py --commit-msg F   # one commit message (commit-msg hook)
   python tools/psp/check_traces.py --log A..B       # messages of a commit range (CI)
   python tools/psp/check_traces.py --install-hooks  # pre-commit + commit-msg hooks
@@ -34,7 +34,7 @@ PATTERNS = [
     (r"(?<![\w.])/(?:home|Users)/[A-Za-z0-9_.-]+/", "home directory"),
     (r"\bAppData[\\/]", "absolute path"),
     # Commit attribution trailers
-    (r"(?i)co-authored-by", "attribution trailer"),
+    (r"(?i)co-?authored-?by", "attribution trailer"),
 ]
 
 PRE_COMMIT = """#!/bin/sh
@@ -93,18 +93,39 @@ def scan_text(label: str, text: str, patterns, allow: list[str]) -> list[str]:
     return hits
 
 
-def scan_files(root: Path, patterns, allow, excluded) -> list[str]:
-    tracked = set(git("ls-files", "-z").split("\0"))
-    staged = set(git("diff", "--cached", "--name-only", "--diff-filter=ACMR", "-z").split("\0"))
+def index_blobs() -> list[tuple[str, str]]:
+    """(path, blob id) of every regular file in the index: what the next commit holds."""
+    out = []
+    for entry in git("ls-files", "-s", "-z").split("\0"):
+        if not entry:
+            continue
+        meta, name = entry.split("\t", 1)
+        mode, blob, _stage = meta.split()
+        if mode in ("100644", "100755"):  # not symlinks or submodules
+            out.append((name, blob))
+    return out
+
+
+def read_blobs(blobs: list[str]) -> list[bytes]:
+    """Contents of the blobs, through one `git cat-file --batch`."""
+    proc = subprocess.run(["git", "cat-file", "--batch"], input="\n".join(blobs).encode() + b"\n",
+                          capture_output=True, check=True)
+    data, pos, out = proc.stdout, 0, []
+    for _ in blobs:
+        header_end = data.index(b"\n", pos)
+        size = int(data[pos:header_end].split()[2])
+        out.append(data[header_end + 1:header_end + 1 + size])
+        pos = header_end + 1 + size + 1
+    return out
+
+
+def scan_files(patterns, allow, excluded) -> list[str]:
+    entries = index_blobs()
     hits = []
-    for name in sorted((tracked | staged) - {""}):
+    for name, _ in entries:
         if any(name == e.rstrip("/") or name.startswith(e.rstrip("/") + "/") for e in excluded):
             hits.append(f"{name}: listed in .git/info/exclude, must stay out of the repository")
-            continue
-        path = root / name
-        if not path.is_file() or path.is_symlink():
-            continue
-        data = path.read_bytes()
+    for (name, _), data in zip(entries, read_blobs([b for _, b in entries])):
         if b"\0" in data[:8192]:
             continue  # binary
         hits += scan_text(name, data.decode("utf-8", errors="replace"), patterns, allow)
@@ -146,7 +167,7 @@ def main() -> None:
             hits += scan_text(f"commit {commit[:10]}", git("log", "-1", "--format=%an%n%ae%n%B", commit),
                               patterns, [])
     else:
-        hits = scan_files(root, patterns, allow, excluded)
+        hits = scan_files(patterns, allow, excluded)
     for hit in hits:
         print(hit, file=sys.stderr)
     if hits:
