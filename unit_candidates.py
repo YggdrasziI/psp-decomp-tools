@@ -26,22 +26,36 @@ INSN = re.compile(r"^\s*/\* [0-9A-F]+ ([0-9A-F]{8}) [0-9A-F]{8} \*/\s+([a-z0-9.]
 
 
 def read_functions(paths: list[Path]) -> list[dict]:
+    """Functions of splat assembly files: name, addr, size, calls (jal targets), vfpu,
+    lines (from glabel to endlabel), ins ([(mnemonic, [operands])]) and label (has a
+    local label, i.e. branches inside)."""
     funcs = []
     for path in paths:
         cur = None
-        for line in path.read_text().splitlines():
+        for line in path.read_text(encoding="utf-8").splitlines():
             if m := GLABEL.match(line):
-                cur = {"name": m.group(1), "addr": None, "size": 0, "calls": [], "vfpu": False}
+                cur = {"name": m.group(1), "addr": None, "size": 0, "calls": [], "vfpu": False,
+                       "lines": [line], "ins": [], "label": False}
                 funcs.append(cur)
-            elif cur is not None and (m := INSN.match(line)):
+            elif cur is None:
+                continue
+            elif line.startswith("endlabel"):
+                cur = None
+            elif m := INSN.match(line):
+                cur["lines"].append(line)
                 if cur["addr"] is None:
                     cur["addr"] = int(m.group(1), 16)
                 cur["size"] += 4
                 mnemonic, operands = m.group(2), m.group(3)
+                cur["ins"].append((mnemonic, [x.strip() for x in re.split(r",\s*", operands)] if operands else []))
                 if mnemonic == "jal":
                     cur["calls"].append(operands.strip())
                 if is_vfpu(mnemonic):
                     cur["vfpu"] = True
+            else:
+                cur["lines"].append(line)
+                if re.match(r"\s*\.L", line):
+                    cur["label"] = True
     return [f for f in funcs if f["addr"] is not None]
 
 

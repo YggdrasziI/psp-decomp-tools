@@ -17,6 +17,16 @@ decomp.toml:
 
     [regions.ULES01213]                   # optional: code regions of the progress card
     "Game" = [[0x08804000, 0x0890DE38]]
+
+    [compiler]                            # optional: compiler of the C/C++ units
+    name = "mwccpsp_3.0.1_219"            # tools/compilers/<name>/ (decomp.me archive)
+    exe = "mwccpsp.exe"
+    flags = "-O4"                         # code generation flags, no include paths
+
+    [batch]                               # optional: batch_units.py
+    splits = "notes/SPLITS.md"            # table of units to add rows to
+    [batch.ranges]                        # address ranges to scan, per version
+    ULES01213 = [[0x08811C00, 0x08904000]]
 """
 
 import os
@@ -91,6 +101,17 @@ def module_file(version: str, module: str) -> Path:
 def binutil(name: str) -> Path:
     exe = ".exe" if os.name == "nt" else ""
     return ROOT / "tools" / "binutils" / f"{BINUTILS_PREFIX}{name}{exe}"
+
+
+def compiler() -> tuple[list[str], list[str]]:
+    """([command], [flags]) of the [compiler] of decomp.toml, wibo first off Windows.
+    The flags are the code generation ones; include paths are added by the caller."""
+    cc = CONFIG.get("compiler")
+    if not cc:
+        sys.exit("decomp.toml: no [compiler] section")
+    exe = ROOT / "tools" / "compilers" / cc["name"] / cc["exe"]
+    command = [str(exe)] if os.name == "nt" else [str(ROOT / "tools" / "wibo"), str(exe)]
+    return command, cc.get("flags", "").split()
 
 
 def objdiff_cli() -> Path:

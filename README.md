@@ -56,6 +56,7 @@ Tools
 | `report_diff.py` | Regression gate between two objdiff reports |
 | `progress_badges.py` | README badges, progress card and history from the objdiff report |
 | `unit_candidates.py`, `tu_ends.py` | Find the next functions to decompile and translation-unit ends |
+| `batch_units.py` | Decompile small functions in batches (m2c drafts, tail-call forwarders), keep the matching ones as units (`[batch]` in `decomp.toml`) |
 | `ghidra_sync.py`, `ghidra/SyncSymbols.java` | Push the splat symbols to a Ghidra project (ghidra-allegrex) headless |
 | `check_traces.py` | Pre-commit / CI guard against local paths, attribution trailers and private files |
 | `download_tool.py`, `get_platform.py`, `ninja_syntax.py`, `sha1.py` | Build helpers |
