@@ -50,6 +50,7 @@ Tools
 | `reloc_overrides.py` | `MIPS_NONE` overrides for constants spimdisasm mistook for addresses (PRX only) |
 | `vfpu_words.py`, `assemble.py` | Assemble splat output with GNU as: VFPU and Allegrex-only instructions become `.word` |
 | `compile.py` | Run a compiler, then drop empty allocated sections |
+| `lmgr_patch.py` | Let Metrowerks compilers run natively on Windows (FLEXlm checkout stubbed, as wibo does); applied by `download_tool.py` |
 | `compiler_probe.py` | Compile a probe file and compare its `func_XXXXXXXX` functions with the original |
 | `asm_compare.py` | One function side by side, from `objdiff-cli diff` |
 | `report_diff.py` | Regression gate between two objdiff reports |

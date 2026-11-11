@@ -67,6 +67,10 @@ if download_url.endswith(".zip"):
 elif download_url.endswith(".tar.gz"):
     with tarfile.open(fileobj=io.BytesIO(response.content)) as tar:
         tar.extractall(args.path, filter="data")
+    if args.tool == "compiler" and platform.system == "windows":
+        # Metrowerks compilers wait on the FLEXlm license window when run natively
+        from lmgr_patch import patch_folder
+        patch_folder(args.path)
 else:
     out_path: Path = args.path
     with out_path.open("wb") as f:

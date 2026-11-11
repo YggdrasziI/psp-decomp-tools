@@ -9,6 +9,7 @@ usage: compiler_probe.py <src> --cc <compiler> [--wibo <wibo>] [--version ID] [-
 import argparse
 import re
 import struct
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -37,6 +38,8 @@ def disassemble(obj: Path) -> dict[int, list[tuple[int, int]]]:
 
 
 def main() -> None:
+    # Metrowerks drivers warn and stop without it; includes come from -I flags
+    os.environ.setdefault("MWCIncludes", ".")
     parser = argparse.ArgumentParser(description=__doc__,
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("src", type=Path)

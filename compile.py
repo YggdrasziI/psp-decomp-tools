@@ -15,6 +15,7 @@ usage: compile.py <objcopy> <out.o> <compiler command...>
 """
 
 import struct
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -36,6 +37,8 @@ def empty_alloc_sections(path: Path) -> list[str]:
 
 
 def main() -> None:
+    # Metrowerks drivers warn and stop without it; includes come from -I flags
+    os.environ.setdefault("MWCIncludes", ".")
     if len(sys.argv) < 4:
         sys.exit(__doc__)
     objcopy, out, command = sys.argv[1], Path(sys.argv[2]), sys.argv[3:]
