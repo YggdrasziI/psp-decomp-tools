@@ -228,6 +228,9 @@ def convert(name: str, text: str, array: bool):
         elif l.strip() or body:
             body.append(l)
     body = "\n".join(body)
+    # other unknown types (locals, arguments, partial prototypes): int, or char *
+    decls = [re.sub(r"\bM2C_UNK\b", "s32", d.replace("M2C_UNK *", "char *")) for d in decls]
+    body = re.sub(r"\bM2C_UNK\b", "s32", body.replace("M2C_UNK *", "char *"))
     # m2c leaves out unused arguments below the last used one
     m = re.search(r"^(.*?\b" + name + r")\((.*)\) \{$", body, re.M)
     if m and m.group(2) not in ("", "void"):
