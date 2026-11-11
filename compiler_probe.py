@@ -47,12 +47,15 @@ def main() -> None:
     parser.add_argument("--wibo", type=Path, help="run the compiler through wibo")
     parser.add_argument("--version", default=project.DEFAULT_VERSION)
     parser.add_argument("--module", default=project.DEFAULT_MODULE)
-    parser.add_argument("flags", nargs="*")
-    args = parser.parse_args()
+    # compiler flags follow "--"; split by hand, argparse handles "--" differently
+    # across Python versions
+    argv = sys.argv[1:]
+    flags = argv[argv.index("--") + 1:] if "--" in argv else []
+    args = parser.parse_args(argv[:argv.index("--")] if "--" in argv else argv)
 
     obj = args.src.with_suffix(".o")
     cc = [str(args.wibo.resolve())] if args.wibo else []
-    r = subprocess.run(cc + [str(args.cc.resolve()), "-c", *args.flags, "-o", str(obj), str(args.src)],
+    r = subprocess.run(cc + [str(args.cc.resolve()), "-c", *flags, "-o", str(obj), str(args.src)],
                        capture_output=True, text=True)
     if r.returncode:
         sys.exit(r.stdout + r.stderr)
