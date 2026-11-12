@@ -6,7 +6,10 @@ or FPU, no jump table, size and call count within limits), C sources are tried:
 
   - the m2c draft (`--valid-syntax`), field accesses written `*(type *)(p + off)`,
     with variants: indexed accesses as arrays, unsigned stores, `int` arguments
-    used as pointers, C++ instead of C, explicit casts where the compiler asks;
+    used as pointers, C++ instead of C, explicit casts where the compiler asks.
+    m2c is given the prototypes of the functions already declared in src/ as
+    context (pointers as `void *`, see known_prototypes), then run again without
+    it; drafts that give a known function another argument count are dropped;
   - when m2c calls a function without arguments because the caller passes its own
     incoming registers, the caller's first arguments, as many as the callee reads
     (argument registers $a0-$a3, $t0-$t3 read before written, straight-line scan
@@ -88,6 +91,7 @@ class Config:
         self.ranges = [tuple(r) for r in batch.get("ranges", {}).get(version, [])]
         self.splits = batch.get("splits")
         self.objdump = str(project.binutil("objdump"))
+        self.protos = known_prototypes()
         prx = Prx(project.module_file(version, module))
         self.data = prx.data
         self.off = prx.segments[0].offset - prx.segments[0].vaddr
@@ -106,14 +110,53 @@ def eligible(f: dict, cfg: Config, args) -> bool:
                                      for op, ops in f["ins"])
 
 
-def m2c_draft(f: dict) -> str:
+C_TYPES = {"void", "char", "int", "short", "float", "double", "signed char", "unsigned char",
+           "unsigned short", "unsigned int"}
+
+
+def known_prototypes() -> dict[str, str]:
+    """{name: prototype} of the functions declared or defined in src/, one per function
+    (the definition, else the most common declaration). Pointers become `void *`, which
+    C converts to and from any pointer without a cast (the pointed types of the
+    sources are m2c guesses); other unknown types become `s32`."""
+    from prototypes import read_protos  # prototypes imports this module
+
+    def norm(t: str) -> str:
+        t = re.sub(r"\bconst\b", "", t)
+        base = " ".join(t.replace("*", " ").split())
+        if "*" in t:
+            return "void *"
+        return base if base in TYPES or base in C_TYPES else "s32"
+
+    out = {}
+    for name, ps in read_protos(project.ROOT / "src").items():
+        known = [p for p in ps if p.known]
+        if not known or len({p.count for p in known}) > 1 or any("..." in p.params for p in known):
+            continue
+        p = next((p for p in known if p.definition), None) or max(
+            known, key=lambda p: sum(q.text(name) == p.text(name) for q in known))
+        # drop parameter names: `char *p` -> `char *`, `int a` -> `int`
+        params = [norm(re.sub(r"(?<=[\s*])\w+$", "", x) if re.search(r"[\s*]\w+$", x) and
+                       x.strip() not in C_TYPES else x) for x in p.params]
+        out[name] = f"{norm(p.ret)} {name}({', '.join(params) or 'void'})".replace("* ", "*")
+    return out
+
+
+def m2c_draft(f: dict, protos: dict[str, str] | None = None) -> str:
+    """m2c output; the prototypes of the functions it calls are given as context."""
     src = ".set noat\n.set noreorder\n.section .text\n" + "\n".join(
         re.sub(r"/\* [0-9A-F ]+\*/", "", l) for l in f["lines"] if not l.startswith("nonmatching")) + "\n"
     with tempfile.TemporaryDirectory() as t:
         p = Path(t) / "f.s"
         p.write_text(src, encoding="utf-8")
-        r = subprocess.run([sys.executable, "-m", "m2c.main", "--target", "mips", "--valid-syntax", str(p)],
-                           capture_output=True, text=True)
+        cmd = [sys.executable, "-m", "m2c.main", "--target", "mips", "--valid-syntax"]
+        used = [n for n in (protos or {}) if n != f["name"] and n in src]
+        if used:
+            ctx = Path(t) / "ctx.h"
+            ctx.write_text("\n".join(f"typedef {v} {k};" for k, v in TYPES.items()) + "\n"
+                           + "".join(protos[n] + ";\n" for n in used), encoding="utf-8")
+            cmd += ["--context", str(ctx)]
+        r = subprocess.run(cmd + [str(p)], capture_output=True, text=True)
     return r.stdout
 
 
@@ -624,15 +667,33 @@ def tail_sources(f: dict, callees: Callees):
 
 # ---------------------------------------------------------------- one function
 
-def candidates(f: dict, callees: Callees):
+def candidates(f: dict, cfg: Config, callees: Callees):
     """Yield (declarations, body, lang) to try, best guesses first."""
     for decls, body in tail_sources(f, callees):
         yield decls, body, "c"
-    text = m2c_draft(f)
+    # with the known prototypes as context, then without (m2c fails on some contexts)
+    for text in dict.fromkeys([m2c_draft(f, cfg.protos), m2c_draft(f)]):
+        yield from draft_sources(f, cfg, text)
+
+
+def n_params(proto: str) -> int:
+    p = proto[proto.index("(") + 1:proto.rindex(")")].strip()
+    return 0 if p in ("", "void") else p.count(",") + 1
+
+
+def draft_sources(f: dict, cfg: Config, text: str):
     plain, arr = convert(f["name"], text, False), convert(f["name"], text, True)
     if plain is None:
         return
-    decls = plain[0]
+    # a draft must give known functions their known argument count
+    for d in plain[0]:
+        if (m := re.search(r"\b(\w+)\(", d)) and m.group(1) in cfg.protos and "()" not in d \
+                and n_params(d) != n_params(cfg.protos[m.group(1)]):
+            return
+    # m2c leaves out the declarations it was given as context
+    decls = plain[0] + [f"extern {cfg.protos[n]};" for n in sorted(cfg.protos)
+                        if n != f["name"] and re.search(r"\b" + n + r"\(", text)
+                        and not any(re.search(r"\b" + n + r"\(", d) for d in plain[0])]
     bodies = [plain[1]] + ([arr[1]] if arr and arr[1] != plain[1] else [])
     bodies += [b.replace("(s16 *)", "(u16 *)").replace("(s8 *)", "(u8 *)") for b in bodies
                if "(s16 *)" in b or "(s8 *)" in b]
@@ -650,7 +711,7 @@ def candidates(f: dict, callees: Callees):
 def solve(f: dict, cfg: Config, callees: Callees, verbose: bool = False):
     """-> (state, source, lang) of the first matching source, else the first try."""
     first = None
-    for decls, body, lang in candidates(f, callees):
+    for decls, body, lang in candidates(f, cfg, callees):
         state, src, err = try_source(cfg, f["name"], f["size"], decls, body, lang)
         if state == "OK" and KR_DECL.search(src):
             fixed = pass_arguments(src, f["name"], callees)
