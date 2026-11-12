@@ -714,6 +714,16 @@ def draft_sources(f: dict, cfg: Config, text: str, ctx: dict[str, str]):
     bodies = [plain[1]] + ([arr[1]] if arr and arr[1] != plain[1] else [])
     bodies += [b.replace("(s16 *)", "(u16 *)").replace("(s8 *)", "(u8 *)") for b in bodies
                if "(s16 *)" in b or "(s8 *)" in b]
+    # m2c reads `D_X[i]` of a symbol it typed as char as `*(&D_X + (i * 2))`: try the
+    # element types of that size
+    idx = re.compile(r"\*\(&(D_\w+) \+ \(([^()]*(?:\([^()]*\)[^()]*)*) \* ([24])\)\)")
+    if idx.search(plain[1]):
+        for k, types in (("2", ("s16", "u16")), ("4", ("s32",))):
+            for t in types:
+                b = idx.sub(lambda m: f"(({t} *)&{m.group(1)})[{m.group(2)}]" if m.group(3) == k
+                            else m.group(0), plain[1])
+                if b != plain[1]:
+                    bodies.append(b)
     m = re.search(r"^.*\b" + f["name"] + r"\(([^)]*)\) \{$", bodies[0], re.M)
     if m and "s32 arg" in m.group(1):
         bodies.append(bodies[0].replace(m.group(0), re.sub(r"s32 (arg\d)", r"char *\1", m.group(0))))
