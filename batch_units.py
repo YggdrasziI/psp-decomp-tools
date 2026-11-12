@@ -8,8 +8,10 @@ or FPU, no jump table, size and call count within limits), C sources are tried:
     with variants: indexed accesses as arrays, unsigned stores, `int` arguments
     used as pointers, C++ instead of C, explicit casts where the compiler asks.
     m2c is given the prototypes of the functions already declared in src/ as
-    context (pointers as `void *`, see known_prototypes), then run again without
-    it; drafts that give a known function another argument count are dropped;
+    context (pointers as `void *`, see known_prototypes) and, for functions still
+    in assembly, as many `s32` arguments as they read (guess_prototypes); then it
+    runs with the first set only, then without context; drafts that give a
+    function of src/ another argument count are dropped;
   - when m2c calls a function without arguments because the caller passes its own
     incoming registers, the caller's first arguments, as many as the callee reads
     (argument registers $a0-$a3, $t0-$t3 read before written, straight-line scan
@@ -92,6 +94,7 @@ class Config:
         self.splits = batch.get("splits")
         self.objdump = str(project.binutil("objdump"))
         self.protos = known_prototypes()
+        self.guessed = {}  # functions still in assembly, see guess_prototypes
         prx = Prx(project.module_file(version, module))
         self.data = prx.data
         self.off = prx.segments[0].offset - prx.segments[0].vaddr
@@ -672,8 +675,22 @@ def candidates(f: dict, cfg: Config, callees: Callees):
     for decls, body in tail_sources(f, callees):
         yield decls, body, "c"
     # with the known prototypes as context, then without (m2c fails on some contexts)
-    for text in dict.fromkeys([m2c_draft(f, cfg.protos), m2c_draft(f)]):
-        yield from draft_sources(f, cfg, text)
+    every = {**cfg.guessed, **cfg.protos}
+    for text in dict.fromkeys([m2c_draft(f, every), m2c_draft(f, cfg.protos), m2c_draft(f)]):
+        yield from draft_sources(f, cfg, text, every)
+
+
+def guess_prototypes(cfg: Config, callees: Callees, funcs: list[dict]) -> dict[str, str]:
+    """`s32 f(s32, ...)` for the functions still in assembly, with as many arguments as
+    they read (a lower bound; variadic functions are left out). Given to m2c, which
+    otherwise guesses from the registers the caller sets."""
+    out = {}
+    for f in funcs:
+        if f["name"].startswith("func_") and f["name"] not in cfg.protos:
+            n = callees.reads(f["name"])
+            if n is not None:
+                out[f["name"]] = f"s32 {f['name']}({', '.join(['s32'] * n) or 'void'})"
+    return out
 
 
 def n_params(proto: str) -> int:
@@ -681,7 +698,7 @@ def n_params(proto: str) -> int:
     return 0 if p in ("", "void") else p.count(",") + 1
 
 
-def draft_sources(f: dict, cfg: Config, text: str):
+def draft_sources(f: dict, cfg: Config, text: str, ctx: dict[str, str]):
     plain, arr = convert(f["name"], text, False), convert(f["name"], text, True)
     if plain is None:
         return
@@ -691,7 +708,7 @@ def draft_sources(f: dict, cfg: Config, text: str):
                 and n_params(d) != n_params(cfg.protos[m.group(1)]):
             return
     # m2c leaves out the declarations it was given as context
-    decls = plain[0] + [f"extern {cfg.protos[n]};" for n in sorted(cfg.protos)
+    decls = plain[0] + [f"extern {ctx[n]};" for n in sorted(ctx)
                         if n != f["name"] and re.search(r"\b" + n + r"\(", text)
                         and not any(re.search(r"\b" + n + r"\(", d) for d in plain[0])]
     bodies = [plain[1]] + ([arr[1]] if arr and arr[1] != plain[1] else [])
@@ -927,6 +944,7 @@ def main() -> None:
     funcs = sorted(read_functions(sorted(project.asm_dir(args.version, args.module).glob("text*.s"))),
                    key=lambda f: f["addr"])
     callees = Callees(cfg, funcs)
+    cfg.guessed = guess_prototypes(cfg, callees, funcs)
     if args.show:
         f = next((f for f in funcs if f["name"] == args.show), None)
         if f is None:
