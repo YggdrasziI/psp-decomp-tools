@@ -6,7 +6,9 @@ or FPU, no jump table, size and call count within limits), C sources are tried:
 
   - the m2c draft (`--valid-syntax`), field accesses written `*(type *)(p + off)`,
     with variants: indexed accesses as arrays, unsigned stores, `int` arguments
-    used as pointers, C++ instead of C, explicit casts where the compiler asks.
+    used as pointers, C++ instead of C, explicit casts where the compiler asks,
+    dereferences of untyped values (`*temp`, `*(0x10000 + (s32) p)`, `*f(...)`)
+    given the widths the function loads or stores (typed_derefs).
     m2c is given the prototypes of the functions already declared in src/ as
     context (pointers as `void *`, see known_prototypes) and, for functions still
     in assembly, as many `s32` arguments as they read (guess_prototypes); then it
@@ -729,12 +731,116 @@ def draft_sources(f: dict, cfg: Config, text: str, ctx: dict[str, str]):
     m = re.search(r"^.*\b" + f["name"] + r"\(([^)]*)\) \{$", bodies[0], re.M)
     if m and "s32 arg" in m.group(1):
         bodies.append(bodies[0].replace(m.group(0), re.sub(r"s32 (arg\d)", r"char *\1", m.group(0))))
+    bodies += [b for b0 in list(bodies) for b in typed_derefs(f, decls, b0)]
     kr = KR_DECL.search("\n".join(decls + bodies))
     for lang in ("c", "cpp"):
         if lang == "cpp" and kr:  # C++ reads `f()` as taking no arguments
             break
         for b in bodies:
             yield decls, b, lang
+
+
+TYPE_WORDS = {"void", "char", "int", "short", "long", "signed", "unsigned", "const", "s8", "u8",
+              "s16", "u16", "s32", "u32", "f32"}
+
+
+def matching(text: str, i: int) -> int:
+    """Index just past the parenthesis that closes the one at text[i], or -1."""
+    depth = 0
+    for j in range(i, len(text)):
+        depth += {"(": 1, ")": -1}.get(text[j], 0)
+        if not depth:
+            return j + 1
+    return -1
+
+
+def untyped_derefs(decls: list[str], body: str) -> list[tuple[int, int]]:
+    """(start, end) of the operands of the `*` that m2c applies to a non-pointer
+    (`*temp_s1`, `*(0xF7A57C + (s32) p)`, `*func_X(...)` returning s32), which
+    mwccpsp rejects ("pointer/array required"). Pointers are the names declared with
+    `*` or as arrays, and the functions declared as returning a pointer."""
+    decl_line = re.compile(r"^\s*(?:\w+\s+)+\**\s*\w+(?:\[[^\]]*\])?;$")
+    text = "\n".join(decls + [l for l in body.split("\n")
+                              if decl_line.match(l) or re.search(r"\b\w+\(.*\) \{$", l)])
+    ptrs = set(re.findall(r"\*\s*(\w+)\s*(?=[;,)\[(])", text)) | set(re.findall(r"\b\w+\s+(\w+)\[", text))
+
+    def is_ptr(expr: str) -> bool:
+        expr = expr.strip()
+        while expr.startswith("(") and matching(expr, 0) == len(expr):
+            expr = expr[1:-1].strip()
+        depth, terms, start = 0, [], 0
+        for k, c in enumerate(expr):
+            depth += {"(": 1, ")": -1}.get(c, 0)
+            if depth == 0 and c in "+-" and k > 0 and expr[k - 1] == " ":
+                terms.append(expr[start:k])
+                start = k + 1
+        terms.append(expr[start:])
+        for t in (t.strip() for t in terms):
+            if t.startswith("&") or re.match(r"\((?:\w+ )*\w+ \*+\)", t):
+                return True
+            if (m := re.match(r"\w+", t)) and m.group(0) in ptrs:
+                return True
+        return False
+
+    out = []
+    for m in re.finditer(r"\*", body):
+        i = m.start()
+        line_start = body.rfind("\n", 0, i) + 1
+        line_end = body.find("\n", i)
+        line = body[line_start:line_end if line_end >= 0 else len(body)]
+        if decl_line.match(line) or re.search(r"\b\w+\(.*\) \{$", line):
+            continue
+        before = body[line_start:i].rstrip()
+        prev = before[-1:]
+        if prev and prev not in "(=,!&|<>+-*/%?:;{}[~" and not before.endswith("return"):
+            if prev != ")":
+                continue
+            # `(type) *x` is a cast then a dereference; `a) * b` is a product
+            words = before[before.rfind("(") + 1:-1].replace("*", " ").split()
+            if not words or not all(w in TYPE_WORDS for w in words):
+                continue
+        j = i + 1
+        if j >= len(body) or body[j] in " )":
+            continue
+        if body[j] == "(":
+            end = matching(body, j)
+            if end < 0:
+                continue
+            inner = body[j + 1:end - 1].strip()
+            if re.fullmatch(r"(?:\w+ )*\w+ \*+", inner) or is_ptr(inner):  # `*(T *)...`, pointer
+                continue
+            out.append((j, end))
+        elif (mm := re.match(r"[A-Za-z_]\w*", body[j:])):
+            if mm.group(0) in ptrs:
+                continue
+            end = j + mm.end()
+            if end < len(body) and body[end] == "(":
+                end = matching(body, end)
+                if end < 0:
+                    continue
+            out.append((j, end))
+    return out
+
+
+def typed_derefs(f: dict, decls: list[str], body: str) -> list[str]:
+    """Bodies where each untyped dereference (untyped_derefs) gets a type of a width
+    the function loads or stores: every combination up to 3 places, else one type
+    for all."""
+    sites = untyped_derefs(decls, body)
+    if not sites:
+        return []
+    ops = {op for op, _ in f["ins"]}
+    types = [t for t, o in (("s32", ("lw", "sw")), ("u8", ("lbu", "sb")), ("u16", ("lhu", "sh")),
+                            ("s8", ("lb",)), ("s16", ("lh",))) if ops & set(o)] or ["s32"]
+    combos = itertools.product(types, repeat=len(sites)) if len(sites) <= 3 \
+        else ([t] * len(sites) for t in types)
+    out = []
+    for combo in itertools.islice(combos, 64):
+        b = body
+        for (a, e), t in sorted(zip(sites, combo), reverse=True):
+            b = b[:a] + f"({t} *)({b[a:e]})" + b[e:]
+        out.append(b)
+    return out
 
 
 def grow_buffer(cfg: Config, f: dict, body: str):
