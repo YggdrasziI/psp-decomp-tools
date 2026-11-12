@@ -735,11 +735,38 @@ def draft_sources(f: dict, cfg: Config, text: str, ctx: dict[str, str]):
             yield decls, b, lang
 
 
+def grow_buffer(cfg: Config, f: dict, body: str):
+    """m2c types a stack buffer by its first use (`s32 sp1C;`, passed as `&sp1C`). When
+    the original frame is larger (`addiu $sp, $sp, -X`), make the only such local a
+    char array that fills the gap. -> new bodies, largest buffer first (the saved
+    registers at the top of the frame take an unknown part of it)."""
+    addr = int(f["name"][5:], 16)
+    w = cfg.word(addr)
+    if w >> 16 != 0x27BD or not w & 0x8000:
+        return []
+    frame = 0x10000 - (w & 0xFFFF)
+    locs = [m for m in re.finditer(r"^    (s8|u8|s16|u16|s32|u32|char) (sp[0-9A-F]+);$", body, re.M)
+            if "&" + m.group(2) in body]
+    if len(locs) != 1:
+        return []
+    m = locs[0]
+    top = frame - int(m.group(2)[2:], 16)
+    return [body.replace(m.group(0), f"    char {m.group(2)}[{size:#x}];", 1).replace(
+        f"&{m.group(2)}", m.group(2)) for size in range(top, top - 0x30, -4)
+        if size > SIZES.get(m.group(1), 4)]
+
+
 def solve(f: dict, cfg: Config, callees: Callees, verbose: bool = False):
     """-> (state, source, lang) of the first matching source, else the first try."""
     first = None
     for decls, body, lang in candidates(f, cfg, callees):
         state, src, err = try_source(cfg, f["name"], f["size"], decls, body, lang)
+        if state.startswith("differs at 0,"):
+            for grown in grow_buffer(cfg, f, body):
+                state2, src2, err2 = try_source(cfg, f["name"], f["size"], decls, grown, lang)
+                if state2 == "OK":
+                    state, src, err = state2, src2, err2
+                    break
         if state == "OK" and KR_DECL.search(src):
             fixed = pass_arguments(src, f["name"], callees)
             if fixed is None:
