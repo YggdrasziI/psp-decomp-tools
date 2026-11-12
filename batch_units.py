@@ -61,7 +61,7 @@ import struct
 import subprocess
 import sys
 import tempfile
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ProcessPoolExecutor
 from pathlib import Path
 
 import yaml
@@ -1066,6 +1066,18 @@ def write(cfg: Config, units: list, base: int) -> None:
 
 # ---------------------------------------------------------------- main
 
+_worker = None  # (cfg, callees) of a worker process, see _init_worker
+
+
+def _init_worker(cfg: Config, callees: Callees) -> None:
+    global _worker
+    _worker = cfg, callees
+
+
+def _solve_worker(f: dict):
+    return (f, *solve(f, *_worker))
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     num = lambda x: int(x, 0)  # noqa: E731
@@ -1101,8 +1113,9 @@ def main() -> None:
     todo = [f for f in funcs if eligible(f, cfg, args)]
     print(f"{len(todo)} functions to try")
     print(f"{jobs} workers")
-    with ThreadPoolExecutor(jobs) as pool:
-        results = list(pool.map(lambda f: (f, *solve(f, cfg, callees)), todo))
+    # processes, not threads: the drafts and comparisons are Python work held by the GIL
+    with ProcessPoolExecutor(jobs, initializer=_init_worker, initargs=(cfg, callees)) as pool:
+        results = list(pool.map(_solve_worker, todo, chunksize=1))
     states = {}
     for _, state, _, _ in results:
         key = state.split(" at ")[0].split(" 0x")[0]
