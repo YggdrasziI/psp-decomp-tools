@@ -43,6 +43,7 @@ decomp.toml ([compiler] as in project.py):
 
     [batch]
     splits = "notes/SPLITS.md"      # optional: table of units to add rows to
+    jobs = 8                        # optional: parallel workers (default: all CPUs)
     [batch.ranges]                  # address ranges to scan, per version
     ULES01213 = [[0x08811C00, 0x08904000]]
 
@@ -92,6 +93,7 @@ class Config:
         batch = project.CONFIG.get("batch", {})
         self.ranges = [tuple(r) for r in batch.get("ranges", {}).get(version, [])]
         self.splits = batch.get("splits")
+        self.jobs = batch.get("jobs")
         self.objdump = str(project.binutil("objdump"))
         self.protos = known_prototypes()
         self.guessed = {}  # functions still in assembly, see guess_prototypes
@@ -968,12 +970,14 @@ def main() -> None:
     parser.add_argument("--max-calls", type=int, default=2)
     parser.add_argument("--start", type=num, help="scan from this address (default: decomp.toml ranges)")
     parser.add_argument("--end", type=num)
-    parser.add_argument("-j", "--jobs", type=int, default=os.cpu_count() or 4)
+    parser.add_argument("-j", "--jobs", type=int,
+                        help="parallel workers (default: [batch] jobs of decomp.toml, else all CPUs)")
     parser.add_argument("--write", action="store_true", help="write src/, the splat yaml and table rows")
     parser.add_argument("--show", metavar="FUNC", help="print the sources tried for one function")
     args = parser.parse_args()
 
     cfg = Config(args.version, args.module)
+    jobs = args.jobs or cfg.jobs or os.cpu_count() or 4
     if args.start is not None:
         cfg.ranges = [(args.start, args.end or 1 << 32)]
     if not cfg.ranges:
@@ -990,7 +994,8 @@ def main() -> None:
         return
     todo = [f for f in funcs if eligible(f, cfg, args)]
     print(f"{len(todo)} functions to try")
-    with ThreadPoolExecutor(args.jobs) as pool:
+    print(f"{jobs} workers")
+    with ThreadPoolExecutor(jobs) as pool:
         results = list(pool.map(lambda f: (f, *solve(f, cfg, callees)), todo))
     states = {}
     for _, state, _, _ in results:
