@@ -847,6 +847,7 @@ def draft_sources(f: dict, cfg: Config, text: str, ctx: dict[str, str]):
     bodies += [b for b0 in list(bodies) for b in typed_derefs(f, decls, b0)]
     bodies += [b for b0 in list(bodies) for b in stack_arrays(f, b0) if b not in bodies]
     bodies += [b for b0 in list(bodies) for b in pointer_offsets(b0) if b not in bodies]
+    bodies += [b for b0 in list(bodies) for b in bool_tests(b0) if b not in bodies]
     bodies += [b for b0 in list(bodies) for b in invert_ifs(b0) if b not in bodies]
     bodies += [b for b0 in list(bodies) for b in narrow_params(f["name"], b0) if b not in bodies]
     kr = KR_DECL.search("\n".join(decls + bodies))
@@ -1078,6 +1079,44 @@ def typed_derefs(f: dict, decls: list[str], body: str) -> list[str]:
         for (a, e), t in sorted(zip(sites, combo), reverse=True):
             b = b[:a] + f"({t} *)({b[a:e]})" + b[e:]
         out.append(b)
+    return out
+
+
+def bool_tests(body: str, limit: int = 3) -> list[str]:
+    """The original turns a flag test into a C++ `bool` (`andi`, `sltu $v0, $zero, $v0`)
+    and compares that with 0 or 1 (an inlined `bool` getter): `!(A & K)`,
+    `(A & K) == 0` and `(A & K) == 1` become `(bool) (A & K) == 0 / 1` (func_0881C884,
+    func_08828884; C++ only). One body per site (the first `limit`), and one with all."""
+    sites = []
+    for m in re.finditer(r"!\(|\(", body):
+        start = m.end() - 1
+        if m.group(0) == "(" and m.start() and re.match(r"[\w\])]", body[m.start() - 1]):
+            continue  # a call's argument list, an index, a cast's operand
+        end = matching(body, start)
+        if end < 0:
+            continue
+        inner = body[start + 1:end - 1]
+        if len(split_top(inner, " & ")) != 2 or any(len(split_top(inner, op)) > 1
+                                                    for op in (" && ", " || ", " == ", " != ")):
+            continue
+        if m.group(0) == "!(":
+            sites.append((m.start(), end, f"((bool) ({inner}) == 0)"))
+        elif (t := re.match(r" (==) ([01])\b", body[end:])):
+            sites.append((start, end + t.end(), f"(bool) ({inner}) == {t.group(2)}"))
+    kept = []
+    for s in sites:
+        if all(s[0] >= t[1] or s[1] <= t[0] for t in kept):
+            kept.append(s)
+    sites = kept
+
+    def apply(chosen):
+        b = body
+        for a, e, new in sorted(chosen, reverse=True):
+            b = b[:a] + new + b[e:]
+        return b
+    out = [apply([s]) for s in sites[:limit]]
+    if len(sites) > 1:
+        out.append(apply(sites))
     return out
 
 
