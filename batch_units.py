@@ -845,6 +845,7 @@ def draft_sources(f: dict, cfg: Config, text: str, ctx: dict[str, str]):
     if m and "s32 arg" in m.group(1):
         bodies.append(bodies[0].replace(m.group(0), re.sub(r"s32 (arg\d)", r"char *\1", m.group(0))))
     bodies += [b for b0 in list(bodies) for b in typed_derefs(f, decls, b0)]
+    bodies += [b for b0 in list(bodies) for b in stack_arrays(f, b0) if b not in bodies]
     bodies += [b for b0 in list(bodies) for b in invert_ifs(b0) if b not in bodies]
     bodies += [b for b0 in list(bodies) for b in narrow_params(f["name"], b0) if b not in bodies]
     kr = KR_DECL.search("\n".join(decls + bodies))
@@ -1076,6 +1077,78 @@ def typed_derefs(f: dict, decls: list[str], body: str) -> list[str]:
         for (a, e), t in sorted(zip(sites, combo), reverse=True):
             b = b[:a] + f"({t} *)({b[a:e]})" + b[e:]
         out.append(b)
+    return out
+
+
+LOAD_TYPES = {"lb": "s8", "lbu": "u8", "lh": "s16", "lhu": "u16", "lw": "s32",
+              "sb": "s8", "sh": "s16", "sw": "s32"}
+
+
+def stack_arrays(f: dict, body: str, limit: int = 6) -> list[str]:
+    """m2c declares the first word of a stack structure passed by address (`u16 sp10;`,
+    `&sp10`) and uses the other fields undeclared (`sp12`, `unksp2E`). Each
+    undeclared `spYY` goes to the closest such local `spXX` below it, made an array
+    of its type up to the top of the frame (`u16 sp10[8]`, sizes down to the last
+    field, the first `limit`): `spXX[(YY - XX) / size]`, or `*(T *)((char *)spXX +
+    d)` with T the width the function loads or stores at YY when not aligned."""
+    ins = f["ins"]
+    if not ins or ins[0][0] != "addiu" or ins[0][1][:2] != ["$sp", "$sp"]:
+        return []
+    frame = -int(ins[0][1][2], 0)
+    decl = {m.group(2): (m.group(1), m.group(0)) for m in
+            re.finditer(r"^    (s8|u8|s16|u16|s32|u32) (sp([0-9A-F]+));$", body, re.M)
+            if re.search("&" + m.group(2) + r"\b", body)}
+    used = set(re.findall(r"\b((?:unk)?sp[0-9A-F]+)\b", body))
+    undef = sorted(n for n in used if n not in decl and not re.search(
+        r"^\s+(?:\w+\s+)+\**" + n + r"(?:\[\w*\])?;$", body, re.M))
+    if not undef or not decl:
+        return []
+    width = {}
+    for op, ops in ins:
+        if op in LOAD_TYPES and len(ops) == 2 and (m := re.fullmatch(r"(-?0x[0-9A-F]+|\d+)\(\$sp\)", ops[1])):
+            width.setdefault(int(m.group(1), 0), LOAD_TYPES[op])
+    off = lambda n: int(re.sub(r"^(?:unk)?sp", "", n), 16)  # noqa: E731
+    plan = {}  # base -> [(name, offset from base, width)]
+    for n in undef:
+        bases = [b for b in decl if off(b) < off(n)]
+        if not bases:
+            return []
+        b = max(bases, key=off)
+        plan.setdefault(b, []).append((n, off(n) - off(b), width.get(off(n))))
+    # the array of a base ends at the next local passed by address, or the frame top;
+    # locals declared inside it become fields too
+    others = {m.group(2): m.group(0) for m in
+              re.finditer(r"^    (s8|u8|s16|u16|s32|u32) (sp([0-9A-F]+));\n", body, re.M) if m.group(2) not in decl}
+    ends = {b: min([off(c) for c in decl if off(c) > off(b)] + [frame]) for b in plan}
+    for b in plan:
+        for n in others:
+            if off(b) < off(n) < ends[b]:
+                plan[b].append((n, off(n) - off(b), width.get(off(n))))
+                body = body.replace(others[n], "", 1)
+    out_sets = []
+    for b, fields in plan.items():
+        t, line = decl[b]
+        size = SIZES[t]
+        last = max(d + SIZES.get(w or t, size) for _, d, w in fields)
+        top = ends[b] - off(b)
+        counts = [n for n in range(top // size, -(-last // size) - 1, -1)][:limit]
+        if not counts:  # a field past the next local or the frame top
+            return []
+        out_sets.append((b, t, line, size, fields, counts))
+    out = []
+    for k in range(max(len(s[5]) for s in out_sets)):
+        nb = body
+        for b, t, line, size, fields, counts in out_sets:
+            n = counts[min(k, len(counts) - 1)]
+            nb = nb.replace(line, "\0D", 1)
+            nb = re.sub(r"&" + b + r"\b", "\0P", nb)  # `&spXX` -> the array itself
+            nb = re.sub(r"\b" + b + r"\b", f"{b}[0]", nb)  # `spXX` -> its first element
+            nb = nb.replace("\0P", b).replace("\0D", f"    {t} {b}[{n}];")
+            for name, d, w in fields:
+                acc = f"{b}[{d // size}]" if d % size == 0 and (w is None or SIZES[w] == size) \
+                    else f"*({w or t} *)((char *){b} + {d:#x})"
+                nb = re.sub(r"\b" + name + r"\b", acc, nb)
+        out.append(nb)
     return out
 
 
