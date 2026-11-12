@@ -761,6 +761,7 @@ def draft_sources(f: dict, cfg: Config, text: str, ctx: dict[str, str]):
         bodies.append(bodies[0].replace(m.group(0), re.sub(r"s32 (arg\d)", r"char *\1", m.group(0))))
     bodies += [b for b0 in list(bodies) for b in typed_derefs(f, decls, b0)]
     bodies += [b for b0 in list(bodies) for b in invert_ifs(b0) if b not in bodies]
+    bodies += [b for b0 in list(bodies) for b in narrow_params(f["name"], b0) if b not in bodies]
     kr = KR_DECL.search("\n".join(decls + bodies))
     for lang in ("c", "cpp"):
         if lang == "cpp" and kr:  # C++ reads `f()` as taking no arguments
@@ -852,6 +853,42 @@ def invert_ifs(body: str, limit: int = 4) -> list[str]:
     if len(sites) > 1:
         variants.append(apply(sites))
     return variants
+
+
+def narrow_params(name: str, body: str) -> list[str]:
+    """m2c reads an `unsigned char` / `unsigned short` parameter as `s32 argN` masked
+    at every use (`argN & 0xFF`); mwccpsp orders the operands of later operations by
+    the declared type (func_08852F1C). For each such parameter: `u8 argN` / `u16
+    argN` without the masks. One body per parameter, and one with all of them."""
+    m = re.search(r"^.*\b" + name + r"\(([^)]*)\) \{$", body, re.M)
+    if not m:
+        return []
+    sites = []
+    for p in re.findall(r"\bs32 (arg\d+)\b", m.group(1)):
+        uses = re.findall(r"\b" + p + r"\b(?: & (0xFFFF|0xFF)\b)?", body[m.end():])
+        if uses and len(set(uses)) == 1 and uses[0]:
+            sites.append((p, "u8" if uses[0] == "0xFF" else "u16", uses[0]))
+
+    def apply(chosen):
+        head, rest = m.group(0), body[m.end():]
+        for p, t, mask in chosen:
+            head = re.sub(r"\bs32 " + p + r"\b", f"{t} {p}", head)
+            rest = re.sub(r"\(" + p + " & " + mask + r"\)", p, rest)
+            rest = re.sub(r"\b" + p + " & " + mask + r"\b", p, rest)
+            # `temp = argN;` as the only store to a local: use the parameter
+            for t in re.findall(r"^[ \t]+(\w+) = " + p + r";$", rest, re.M):
+                if len(re.findall(r"\b" + t + r" =[^=]", rest)) == 1:
+                    decl = "|".join(sorted(TYPE_WORDS, key=len, reverse=True))
+                    rest = re.sub(r"^[ \t]+(?:(?:" + decl + r") )+" + t + r";\n|^[ \t]+" + t + " = " + p + r";\n",
+                                  "", rest,
+                                  flags=re.M)
+                    rest = re.sub(r"\b" + t + r"\b", p, rest)
+        return body[:m.start()] + head + rest
+
+    out = [apply([s]) for s in sites]
+    if len(sites) > 1:
+        out.append(apply(sites))
+    return out
 
 
 TYPE_WORDS = {"void", "char", "int", "short", "long", "signed", "unsigned", "const", "s8", "u8",
