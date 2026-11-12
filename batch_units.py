@@ -846,6 +846,7 @@ def draft_sources(f: dict, cfg: Config, text: str, ctx: dict[str, str]):
         bodies.append(bodies[0].replace(m.group(0), re.sub(r"s32 (arg\d)", r"char *\1", m.group(0))))
     bodies += [b for b0 in list(bodies) for b in typed_derefs(f, decls, b0)]
     bodies += [b for b0 in list(bodies) for b in stack_arrays(f, b0) if b not in bodies]
+    bodies += [b for b0 in list(bodies) for b in pointer_offsets(b0) if b not in bodies]
     bodies += [b for b0 in list(bodies) for b in invert_ifs(b0) if b not in bodies]
     bodies += [b for b0 in list(bodies) for b in narrow_params(f["name"], b0) if b not in bodies]
     kr = KR_DECL.search("\n".join(decls + bodies))
@@ -1078,6 +1079,28 @@ def typed_derefs(f: dict, decls: list[str], body: str) -> list[str]:
             b = b[:a] + f"({t} *)({b[a:e]})" + b[e:]
         out.append(b)
     return out
+
+
+def pointer_offsets(body: str) -> list[str]:
+    """m2c writes a large field offset as an integer sum, `*(T *)((0x5623D0 + (s32) p))`;
+    mwccpsp then builds the constant whole (`lui` + `ori`). On a `char *` it splits
+    it between `lui` and the load or store offset, as the original does
+    (func_08880864): `*(T *)((char *)p + 0x5623D0)`. One body with every site."""
+    out, i = body, 0
+    pat = re.compile(r"\((?:\w+ )*\w+ \*+\)\((\((0x[0-9A-Fa-f]+) \+ )")
+    while m := pat.search(out, i):
+        start = m.start(1)
+        end = matching(out, start)
+        if end < 0:
+            break
+        rest = out[start + len(m.group(1)):end - 1].strip()
+        if len(split_top(rest, " + ")) == 1 and len(split_top(rest, " - ")) == 1:  # one term
+            rest = re.sub(r"^\(s32\) ", "", rest)
+        base = rest if re.fullmatch(r"\w+", rest) else f"({rest})"
+        new = f"(char *){base} + {m.group(2)}"
+        out = out[:start] + new + out[end:]
+        i = start + len(new)
+    return [out] if out != body else []
 
 
 LOAD_TYPES = {"lb": "s8", "lbu": "u8", "lh": "s16", "lhu": "u16", "lw": "s32",
