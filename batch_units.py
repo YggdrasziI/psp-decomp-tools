@@ -222,14 +222,16 @@ def index_form(e: str):
     return None
 
 
-def field(e: str, t: str, off: str, array: bool) -> str:
-    """M2C_FIELD(e, t, off) as C: *(t)(e + off), or an array access."""
+def field(e: str, t: str, off: str, array) -> str:
+    """M2C_FIELD(e, t, off) as C: *(t)(e + off), or an array access (array True), with
+    the offset added to a `char *` base (array "char": `(char *)b + off`; `b + off`
+    on an `s32` base is an integer sum, one more instruction)."""
     e = e.strip()
     idx = index_form(e) if array else None
     if idx:
         x, k, b = idx
         b = b if re.fullmatch(r"\w+", b) else f"({b})"
-        base = b if off in ("0", "0x0") else f"{b} + {off}"
+        base = b if off in ("0", "0x0") else f"(char *){b} + {off}" if array == "char" else f"{b} + {off}"
         if SIZES.get(t.replace(" ", "").removesuffix("*")) == k:  # t is a pointer to the element
             return f"(({t})({base}))[{x}]"
         return f"*({t})((E{k} *)({base}))[{x}].b"
@@ -238,7 +240,7 @@ def field(e: str, t: str, off: str, array: bool) -> str:
     return f"*({t})((char *)({e}) + {off})"
 
 
-def expand_fields(code: str, array: bool) -> str:
+def expand_fields(code: str, array) -> str:
     out, i = "", 0
     while (j := code.find("M2C_FIELD(", i)) >= 0:
         out += code[i:j]
@@ -276,7 +278,7 @@ def declaration(l: str) -> str:
     return l.replace("extern M2C_UNK", "extern char")
 
 
-def convert(name: str, text: str, array: bool):
+def convert(name: str, text: str, array):
     """m2c output -> (declarations, body), or None."""
     if not text.strip() or "M2C_ERROR" in text:
         return None
@@ -738,6 +740,10 @@ def draft_sources(f: dict, cfg: Config, text: str, ctx: dict[str, str]):
                         if n != f["name"] and re.search(r"\b" + n + r"\(", text)
                         and not any(re.search(r"\b" + n + r"\(", d) for d in plain[0])]
     bodies = [plain[1]] + ([arr[1]] if arr and arr[1] != plain[1] else [])
+    # array accesses read `p[i]` (`addu i, p`), the pointer sum `p + i * k` (`addu p, i`)
+    arr_c = convert(f["name"], text, "char")
+    if arr_c and arr_c[1] not in bodies:
+        bodies.append(arr_c[1])
     bodies += [b.replace("(s16 *)", "(u16 *)").replace("(s8 *)", "(u8 *)") for b in bodies
                if "(s16 *)" in b or "(s8 *)" in b]
     # m2c reads `D_X[i]` of a symbol it typed as char as `*(&D_X + (i * 2))`: try the
