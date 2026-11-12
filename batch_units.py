@@ -359,6 +359,7 @@ class Callees:
 
     def __init__(self, cfg: Config, asm_funcs: list[dict]):
         self.ins = {f["name"]: f["ins"] for f in asm_funcs}
+        self.extern = {}  # argument counts of imports, set by the caller
         elf = project.build_dir(cfg.version) / f"{cfg.module}.elf"
         if not elf.exists():
             return
@@ -379,7 +380,7 @@ class Callees:
 
     def count(self, name: str, depth: int = 0):
         ins = self.ins.get(name)
-        if not ins or depth > 3:
+        if not ins or depth > 3 or self.variadic(ins):
             return None
         written, read = set(), set()
 
@@ -407,6 +408,47 @@ class Callees:
                 break
             step(op, ops)
         return max([AREGS.index(r) + 1 for r in read] + [0])
+
+    def reads(self, name: str, depth: int = 0):
+        """Argument registers read anywhere before written (in code order): a lower
+        bound of the argument count of a function, None for a variadic one.
+
+        Unlike count(), the scan goes on past calls, so arguments read on a path
+        that skips the first call are seen; a tail jump (`j func_X`) adds what that
+        function reads, when known.
+        """
+        ins = self.ins.get(name)
+        if not ins or depth > 3 or self.variadic(ins):
+            return None
+        written, read = set(), set()
+
+        def step(op, ops):
+            if not ops or op in ("jal", "jr", "j"):
+                return
+            if op.startswith("b") or op in ("sb", "sh", "sw") or op in NO_DEST:
+                srcs, dst = ops, []
+            else:
+                srcs, dst = ops[1:], ops[:1]
+            read.update(r for r in regs_of(srcs) if r in AREGS and r not in written)
+            written.update(regs_of(dst))
+
+        for k, (op, ops) in enumerate(ins):
+            if op == "j" and ops and not ops[0].startswith("."):
+                if k + 1 < len(ins):
+                    step(*ins[k + 1])  # the delay slot runs before the jump
+                n = (self.reads(ops[0], depth + 1) if ops[0].startswith("func_")
+                     else self.extern.get(ops[0])) or 0
+                read.update(r for r in AREGS[:n] if r not in written)
+                continue
+            step(op, ops)
+        return max([AREGS.index(r) + 1 for r in read] + [0])
+
+    @staticmethod
+    def variadic(ins) -> bool:
+        """A variadic function stores the unnamed argument registers, up to $t3, on
+        the stack: its fixed argument count cannot be read from the code."""
+        return any(op == "sw" and len(ops) == 2 and ops[0] == "$t3" and "($sp)" in ops[1]
+                   for op, ops in ins[:24])
 
 
 def pass_arguments(src: str, name: str, callees: Callees):
