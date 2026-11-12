@@ -225,14 +225,24 @@ def index_form(e: str):
 def field(e: str, t: str, off: str, array) -> str:
     """M2C_FIELD(e, t, off) as C: *(t)(e + off), or an array access (array True), with
     the offset added to a `char *` base (array "char": `(char *)b + off`; `b + off`
-    on an `s32` base is an integer sum, one more instruction)."""
+    on an `s32` base is an integer sum, one more instruction). Byte accesses through
+    a sum of two terms `x + b` (stride 1, no `* k` to tell the index) become
+    `((t)((char *)b + off))[x]` with array "byte", `[b]` on `x` with "byte_r"."""
     e = e.strip()
     idx = index_form(e) if array else None
+    char_base = array in ("char", "byte", "byte_r")
+    elem = SIZES.get(t.replace(" ", "").removesuffix("*"))
+    if not idx and array in ("byte", "byte_r") and elem == 1:
+        p = split_top(strip_parens(e), " + ")
+        num = re.compile(r"-?(?:0x[0-9A-Fa-f]+|\d+)")
+        if len(p) == 2 and not any(num.fullmatch(x) for x in p):
+            x, b = (p[0], p[1]) if array == "byte" else (p[1], p[0])
+            idx = strip_parens(x), 1, strip_parens(b)
     if idx:
         x, k, b = idx
         b = b if re.fullmatch(r"\w+", b) else f"({b})"
-        base = b if off in ("0", "0x0") else f"(char *){b} + {off}" if array == "char" else f"{b} + {off}"
-        if SIZES.get(t.replace(" ", "").removesuffix("*")) == k:  # t is a pointer to the element
+        base = b if off in ("0", "0x0") else f"(char *){b} + {off}" if char_base else f"{b} + {off}"
+        if elem == k:  # t is a pointer to the element
             return f"(({t})({base}))[{x}]"
         return f"*({t})((E{k} *)({base}))[{x}].b"
     if re.fullmatch(r"\w+", e):
@@ -744,6 +754,11 @@ def draft_sources(f: dict, cfg: Config, text: str, ctx: dict[str, str]):
     arr_c = convert(f["name"], text, "char")
     if arr_c and arr_c[1] not in bodies:
         bodies.append(arr_c[1])
+    # byte arrays (stride 1, func_08863D58): both terms tried as the index
+    for mode in ("byte", "byte_r"):
+        conv = convert(f["name"], text, mode)
+        if conv and conv[1] not in bodies:
+            bodies.append(conv[1])
     bodies += [b.replace("(s16 *)", "(u16 *)").replace("(s8 *)", "(u8 *)") for b in bodies
                if "(s16 *)" in b or "(s8 *)" in b]
     # m2c reads `D_X[i]` of a symbol it typed as char as `*(&D_X + (i * 2))`: try the
@@ -857,8 +872,8 @@ def invert_ifs(body: str, limit: int = 4) -> list[str]:
 
 def narrow_params(name: str, body: str) -> list[str]:
     """m2c reads an `unsigned char` / `unsigned short` parameter as `s32 argN` masked
-    at every use (`argN & 0xFF`); mwccpsp orders the operands of later operations by
-    the declared type (func_08852F1C). For each such parameter: `u8 argN` / `u16
+    at every use (`argN & 0xFF`); declared narrow, it matches in func_0881C240,
+    func_088493A4 and func_088DDFE8. For each such parameter: `u8 argN` / `u16
     argN` without the masks. One body per parameter, and one with all of them."""
     m = re.search(r"^.*\b" + name + r"\(([^)]*)\) \{$", body, re.M)
     if not m:
