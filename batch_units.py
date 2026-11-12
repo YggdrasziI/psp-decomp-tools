@@ -9,6 +9,8 @@ or FPU, no jump table, size and call count within limits), C sources are tried:
     used as pointers, C++ instead of C, explicit casts where the compiler asks,
     dereferences of untyped values (`*temp`, `*(0x10000 + (s32) p)`, `*f(...)`)
     given the widths the function loads or stores (typed_derefs).
+    m2c also runs with its `mipsee` target ($t0-$t3 renamed $a4-$a7) so that calls
+    keep arguments 5-8 (PSP EABI).
     m2c is given the prototypes of the functions already declared in src/ as
     context (pointers as `void *`, see known_prototypes) and, for functions still
     in assembly, as many `s32` arguments as they read (guess_prototypes); then it
@@ -149,14 +151,22 @@ def known_prototypes() -> dict[str, str]:
     return out
 
 
-def m2c_draft(f: dict, protos: dict[str, str] | None = None) -> str:
-    """m2c output; the prototypes of the functions it calls are given as context."""
+# PSP calls pass arguments 5-8 in $t0-$t3 (EABI); m2c's `mipsee` target knows that
+# ABI under its n32 register names: $t0-$t3 -> $a4-$a7, $t4-$t7 -> $t0-$t3
+EE_REGS = {**{f"t{i}": f"a{i + 4}" for i in range(4)}, **{f"t{i}": f"t{i - 4}" for i in range(4, 8)}}
+
+
+def m2c_draft(f: dict, protos: dict[str, str] | None = None, eabi: bool = False) -> str:
+    """m2c output; the prototypes of the functions it calls are given as context.
+    eabi: `mipsee` target, so that calls keep their arguments in $t0-$t3."""
     src = ".set noat\n.set noreorder\n.section .text\n" + "\n".join(
         re.sub(r"/\* [0-9A-F ]+\*/", "", l) for l in f["lines"] if not l.startswith("nonmatching")) + "\n"
+    if eabi:
+        src = re.sub(r"\$(t[0-7])\b", lambda m: "$" + EE_REGS[m.group(1)], src)
     with tempfile.TemporaryDirectory() as t:
         p = Path(t) / "f.s"
         p.write_text(src, encoding="utf-8")
-        cmd = [sys.executable, "-m", "m2c.main", "--target", "mips", "--valid-syntax"]
+        cmd = [sys.executable, "-m", "m2c.main", "--target", "mipsee" if eabi else "mips", "--valid-syntax"]
         used = [n for n in (protos or {}) if n != f["name"] and n in src]
         if used:
             ctx = Path(t) / "ctx.h"
@@ -680,8 +690,18 @@ def candidates(f: dict, cfg: Config, callees: Callees):
         yield decls, body, "c"
     # with the known prototypes as context, then without (m2c fails on some contexts)
     every = {**cfg.guessed, **cfg.protos}
+    seen = set()
     for text in dict.fromkeys([m2c_draft(f, every), m2c_draft(f, cfg.protos), m2c_draft(f)]):
+        seen.add(text)
         yield from draft_sources(f, cfg, text, every)
+    # then the same with arguments 5-8 ($t0-$t3), drafted only when the above failed
+    if any(op == "jal" for op, _ in f["ins"]) or any(r in ops for _, ops in f["ins"]
+                                                       for r in ("$t0", "$t1", "$t2", "$t3")):
+        for args in ((f, every), (f, cfg.protos), (f,)):
+            text = m2c_draft(*args, eabi=True)
+            if text not in seen:
+                seen.add(text)
+                yield from draft_sources(f, cfg, text, every)
 
 
 def guess_prototypes(cfg: Config, callees: Callees, funcs: list[dict]) -> dict[str, str]:
