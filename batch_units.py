@@ -353,30 +353,100 @@ def disassemble(cfg: Config, obj: str) -> dict:
 
 
 def compile_source(cfg: Config, src: str, lang: str, fix_casts: bool = True):
-    """-> (object functions or None, final source, error text)"""
+    """-> (object functions or None, final source, error text). On "illegal implicit
+    conversion from 'A' to 'B'", the cast to B is added: to a call argument (each
+    argument of the call the compiler points at is tried in turn, pointer-looking
+    ones first, until the error leaves that line), else to a `return` or assigned
+    value."""
     msg = ""
+    pending, last = [], None
     with tempfile.TemporaryDirectory() as t:
         p, o = os.path.join(t, "u." + lang), os.path.join(t, "u.o")
-        for _ in range(6):
+        for _ in range(16):
             Path(p).write_text(src, encoding="utf-8")
             r = subprocess.run([*cfg.cc, "-c", *cfg.flags, "-o", o, p], capture_output=True, text=True,
                                cwd=t, env={**os.environ, "MWCIncludes": "."})
             if not r.returncode:
                 return disassemble(cfg, o), src, ""
             msg = r.stdout + r.stderr
-            # "illegal implicit conversion from 'int' to 'char *'": add the cast
-            m = re.search(r"#\s+(\d+):.*?illegal implicit conversion from '[^']*' to\s*#\s*'([^']*)'",
+            m = re.search(r"#\s+(\d+):.*?illegal implicit conversion from '([^']*)' to\s*#\s*'([^']*)'",
                           msg, re.S)
             if not (fix_casts and m):
                 break
+            ln, frm, to = int(m.group(1)) - 1, m.group(2), m.group(3)
+            if (ln, frm, to) == last:  # the last cast did not remove the error: next one
+                if not pending:
+                    break
+                src = pending.pop(0)
+                continue
             lines = src.split("\n")
-            ln, to = int(m.group(1)) - 1, m.group(2)
+            cands = call_casts(lines[ln], msg, frm, to)
             g = re.match(r"^(\s*)(return )(.+);$", lines[ln]) or re.match(r"^(\s*)(.+? = )(.+);$", lines[ln])
-            if not g:
+            if g:
+                cands.append(f"{g.group(1)}{g.group(2)}({to}) ({g.group(3)});")
+            if not cands:
                 break
-            lines[ln] = f"{g.group(1)}{g.group(2)}({to}) ({g.group(3)});"
-            src = "\n".join(lines)
+            srcs = ["\n".join(lines[:ln] + [c] + lines[ln + 1:]) for c in cands]
+            src, pending, last = srcs[0], srcs[1:], (ln, frm, to)
     return None, src, msg
+
+
+def call_casts(line: str, msg: str, frm: str, to: str) -> list[str]:
+    """Lines with one argument of the call the compiler points at cast to `to`. mwcc
+    prints the end of the source line (cut on the left when long, indentation not
+    as written) and a caret under the `)` that closes the call (or a `,` after
+    the argument)."""
+    m = re.search(r"^(#\s+\d+: )(.*)\n(#\s+Error:\s*)\^", msg, re.M)
+    if not m:
+        return []
+    shown, col = m.group(2), len(m.group(3)) - len(m.group(1))
+    col -= len(shown) - len(shown.lstrip())
+    shown = shown.lstrip()
+    start = line.rfind(shown)
+    if start < 0 or not 0 < col <= len(shown):
+        return []
+    end = start + col
+    if end >= len(line) or line[end] not in ",)":
+        return []
+    # back to the `(` that opens the argument list
+    depth, i = 0, end - 1
+    while i >= 0:
+        c = line[i]
+        if c in ")]":
+            depth += 1
+        elif c in "([":
+            if depth == 0:
+                break
+            depth -= 1
+        i -= 1
+    if i < 0 or line[i] != "(" or not re.search(r"\w\s*$", line[:i]):
+        return []
+    close = end
+    if line[end] == ",":  # caret after one argument: its call's `)`
+        close = matching(line, i) - 1
+        if close < 0:
+            return []
+    args, k, depth = [], i + 1, 0
+    for j in range(i + 1, close + 1):
+        c = line[j]
+        depth += {"(": 1, "[": 1, ")": -1, "]": -1}.get(c, 0) if j < close else 0
+        if j == close or (c == "," and depth == 0):
+            args.append((k, j))
+            k = j + 1
+    num = re.compile(r"-?(?:0x[0-9A-Fa-f]+|\d+)U?")
+    ptrish = lambda a: a.startswith(("&", '"')) or "*)" in a  # noqa: E731
+
+    def key(span):
+        a = line[span[0]:span[1]].strip()
+        return (not ptrish(a)) if frm.endswith("*") else ptrish(a)
+    out = []
+    for a0, a1 in sorted(args, key=key):
+        a = line[a0:a1]
+        if not a.strip() or num.fullmatch(a.strip()) or a.strip().startswith(f"({to})"):
+            continue
+        lead = a[:len(a) - len(a.lstrip())]
+        out.append(f"{line[:a0]}{lead}({to}) ({a.strip()}){line[a1:]}")
+    return out
 
 
 def s16(x: int) -> int:
