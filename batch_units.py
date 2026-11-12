@@ -10,7 +10,9 @@ or FPU, no jump table, size and call count within limits), C sources are tried:
     dereferences of untyped values (`*temp`, `*(0x10000 + (s32) p)`, `*f(...)`)
     given the widths the function loads or stores (typed_derefs).
     m2c also runs with its `mipsee` target ($t0-$t3 renamed $a4-$a7) so that calls
-    keep arguments 5-8 (PSP EABI).
+    keep arguments 5-8 (PSP EABI). An `if` whose block returns, followed by a
+    `return`, is also tried inverted (mwccpsp keeps the source order of blocks;
+    comparisons are negated by their operator, `!(a < b)` compiles differently).
     m2c is given the prototypes of the functions already declared in src/ as
     context (pointers as `void *`, see known_prototypes) and, for functions still
     in assembly, as many `s32` arguments as they read (guess_prototypes); then it
@@ -752,12 +754,98 @@ def draft_sources(f: dict, cfg: Config, text: str, ctx: dict[str, str]):
     if m and "s32 arg" in m.group(1):
         bodies.append(bodies[0].replace(m.group(0), re.sub(r"s32 (arg\d)", r"char *\1", m.group(0))))
     bodies += [b for b0 in list(bodies) for b in typed_derefs(f, decls, b0)]
+    bodies += [b for b0 in list(bodies) for b in invert_ifs(b0) if b not in bodies]
     kr = KR_DECL.search("\n".join(decls + bodies))
     for lang in ("c", "cpp"):
         if lang == "cpp" and kr:  # C++ reads `f()` as taking no arguments
             break
         for b in bodies:
             yield decls, b, lang
+
+
+NEGATED = {"==": "!=", "!=": "==", "<": ">=", ">=": "<", ">": "<=", "<=": ">"}
+
+
+def negate(cond: str) -> str:
+    """`a < b` -> `a >= b` (mwccpsp does not compile `!(a < b)` the same way), `!x` ->
+    `x`, `x` -> `x == 0`; else `!(cond)`."""
+    depth, ops = 0, []
+    i = 0
+    while i < len(cond):
+        c = cond[i]
+        depth += {"(": 1, ")": -1, "[": 1, "]": -1}.get(c, 0)
+        two = cond[i:i + 2]
+        if depth == 0 and two in ("&&", "||"):
+            return f"!({cond})"
+        if depth == 0 and c == "?":
+            return f"!({cond})"
+        if depth == 0 and two in ("<<", ">>", "->"):
+            i += 2
+            continue
+        if depth == 0 and two in ("==", "!=", "<=", ">="):
+            ops.append((i, two))
+            i += 2
+            continue
+        if depth == 0 and c in "<>":
+            ops.append((i, c))
+        i += 1
+    if len(ops) == 1:
+        k, op = ops[0]
+        return cond[:k] + NEGATED[op] + cond[k + len(op):]
+    if ops:
+        return f"!({cond})"
+    if cond.startswith("!") and matching(cond, 1) == len(cond) and cond[1] == "(":
+        return cond[2:-1]
+    if re.fullmatch(r"!\w+", cond):
+        return cond[1:]
+    if re.fullmatch(r"[\w.]+", cond) or (cond.startswith("(") and matching(cond, 0) == len(cond)):
+        return f"{cond} == 0"
+    return f"!({cond})"
+
+
+def invert_ifs(body: str, limit: int = 4) -> list[str]:
+    """mwccpsp lays blocks out in source order; m2c puts the long branch first:
+
+        if (C) {              ->    if (!(C)) {
+            ...; return X;              return Y;
+        }                           }
+        return Y;                   ...; return X;
+
+    for an `if` without `else` whose block ends in `return` or `goto`. One body per
+    such `if` (the first `limit`), and one with all of them inverted."""
+    lines = body.split("\n")
+    sites = []
+    for i, l in enumerate(lines):
+        m = re.match(r"^(\s*)if \((.*)\) \{$", l)
+        if not m:
+            continue
+        ind = m.group(1)
+        end = next((j for j in range(i + 1, len(lines)) if lines[j].startswith(ind + "}")
+                    and not lines[j].startswith(ind + "} ") and len(lines[j]) == len(ind) + 1), None)
+        if end is None or end + 1 >= len(lines) or end - i < 2:
+            continue
+        last, after = lines[end - 1], lines[end + 1]
+        if not re.match(ind + r"    (return\b|goto )", last) or not re.match(ind + r"return\b.*;$", after):
+            continue
+        if any(not b.startswith(ind + "    ") and b.strip() for b in lines[i + 1:end]):
+            continue
+        sites.append((i, end, ind, m.group(2)))
+    sites = [s for k, s in enumerate(sites) if all(s[0] > t[1] + 1 or s[1] < t[0] for t in sites[:k])]
+    sites = sites[:limit]
+
+    def apply(chosen):
+        out, i = [], 0
+        for s, e, ind, cond in sorted(chosen):
+            out += lines[i:s]
+            out += [f"{ind}if ({negate(cond)}) {{", ind + "    " + lines[e + 1][len(ind):], ind + "}"]
+            out += [b[4:] if b.strip() else b for b in lines[s + 1:e]]
+            i = e + 2
+        return "\n".join(out + lines[i:])
+
+    variants = [apply([s]) for s in sites]
+    if len(sites) > 1:
+        variants.append(apply(sites))
+    return variants
 
 
 TYPE_WORDS = {"void", "char", "int", "short", "long", "signed", "unsigned", "const", "s8", "u8",
