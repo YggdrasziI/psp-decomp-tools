@@ -11,7 +11,7 @@ or FPU, no jump table, size and call count within limits), C sources are tried:
     given the widths the function loads or stores (typed_derefs), an allocation
     result kept in a temporary (alloc_temps), pointer sums passed uncast to `void *`
     parameters (pointer_args), structure array elements `&((E<K> *) (p + off))[i]`
-    (stride_arrays).
+    (stride_arrays), `goto`s of merged block tails written out (inline_gotos).
     m2c also runs with its `mipsee` target ($t0-$t3 renamed $a4-$a7) so that calls
     keep arguments 5-8 (PSP EABI). An `if` whose block returns, followed by a
     `return`, is also tried inverted (mwccpsp keeps the source order of blocks;
@@ -822,7 +822,9 @@ def draft_sources(f: dict, cfg: Config, text: str, ctx: dict[str, str]):
     decls = plain[0] + [f"extern {ctx[n]};" for n in sorted(ctx)
                         if n != f["name"] and re.search(r"\b" + n + r"\(", text)
                         and not any(re.search(r"\b" + n + r"\(", d) for d in plain[0])]
-    bodies = [plain[1]] + ([arr[1]] if arr and arr[1] != plain[1] else [])
+    # m2c's merged block tails (`goto`) written out, right after the plain draft
+    bodies = [plain[1], *inline_gotos(plain[1])]
+    bodies += [arr[1]] if arr and arr[1] not in bodies else []
     # array accesses read `p[i]` (`addu i, p`), the pointer sum `p + i * k` (`addu p, i`)
     arr_c = convert(f["name"], text, "char")
     if arr_c and arr_c[1] not in bodies:
@@ -858,13 +860,13 @@ def draft_sources(f: dict, cfg: Config, text: str, ctx: dict[str, str]):
     bodies += [b for b0 in bodies[:4] for b in widen_narrow(f["name"], b0) if b not in bodies]
     bodies += [b for b0 in bodies[:6] for b in sign_loads(b0) if b not in bodies]
     # allocation + inlined constructor: temporary result, word loads, pointer arguments
-    for b0 in bodies[:2]:
+    for b0 in bodies[:3]:
         a = alloc_temps(b0) or b0
         for b in (a, word_derefs(a)):
             if b and b not in bodies:
                 bodies.append(b)
     pairs = [(decls, b) for b in bodies]
-    pairs += [p for b in bodies[:2] + bodies[-4:] if (p := pointer_args(f["name"], decls, b)) and p not in pairs]
+    pairs += [p for b in bodies[:3] + bodies[-6:] if (p := pointer_args(f["name"], decls, b)) and p not in pairs]
     kr = KR_DECL.search("\n".join(decls + bodies))
     for lang in ("c", "cpp"):
         if lang == "cpp" and kr:  # C++ reads `f()` as taking no arguments
@@ -1308,6 +1310,67 @@ def stride_arrays(body: str) -> list[str]:
         if ok and any(re.search(r"\b" + t + r"\b", "\n".join(new)) for t in declared):
             ok = False
         if ok and (b := "\n".join(new)) not in out:
+            out.append(b)
+    return out
+
+
+def inline_gotos(body: str, limit: int = 8) -> list[str]:
+    """m2c merges identical block tails: `goto block_N;` jumps to a label inside a
+    later block. The original repeats the tail (func_088C3C54: each branch of an
+    `if / else if` stores its own result). Each `goto` is replaced with a copy of the
+    statements that follow its label up to the end of the label's block; the label
+    goes when nothing jumps to it any more. A second body also turns
+    `if (a) {...} if (b) {` into `if (a) {...} else if (b) {` where the first block
+    held the `goto` (without it, control would fall into the second test)."""
+
+    def once(text: str, chain: bool):
+        lines = text.split("\n")
+        g = next((n for n, l in enumerate(lines) if re.match(r"^ +goto (\w+);$", l)), None)
+        if g is None:
+            return None
+        label = re.match(r"^ +goto (\w+);$", lines[g]).group(1)
+        at = next((n for n, l in enumerate(lines) if l == label + ":"), None)
+        if at is None or at < g:
+            return None
+        if at == g + 1:  # jump to the next line: no copy
+            new = lines[:g] + lines[g + 1:]
+            if not any(re.match(r"^ +goto " + label + ";$", l) for l in new):
+                new = [l for l in new if l != label + ":"]
+            return "\n".join(new)
+        tail, depth = [], 0
+        for l in lines[at + 1:]:
+            depth += l.count("{") - l.count("}")
+            if depth < 0 or re.match(r"^\w+:$", l):
+                break
+            tail.append(l)
+        if not tail:
+            return None
+        ind = re.match(r"^ *", lines[g]).group(0)
+        base = min(len(re.match(r"^ *", l).group(0)) for l in tail if l.strip())
+        copy = [ind + l[base:] if l.strip() else l for l in tail]
+        new = lines[:g] + copy + lines[g + 1:]
+        if chain:
+            # the block that held the goto ends right after the copy: chain the next if
+            end = g + len(copy)
+            if end + 1 < len(new) and new[end].strip() == "}" and \
+                    re.match(r"^ *if \(", new[end + 1]) and \
+                    len(re.match(r"^ *", new[end + 1]).group(0)) == len(new[end]) - 1:
+                new[end] = new[end] + " else " + new[end + 1].lstrip()
+                del new[end + 1]
+        # the label goes last (removing it first would shift the indexes above)
+        if not any(re.match(r"^ +goto " + label + ";$", l) for l in new):
+            new = [l for l in new if l != label + ":"]
+        return "\n".join(new)
+
+    out = []
+    for chain in (False, True):
+        b = body
+        for _ in range(limit):
+            nb = once(b, chain)
+            if nb is None:
+                break
+            b = nb
+        if b != body and "goto " not in b and b not in out:
             out.append(b)
     return out
 
