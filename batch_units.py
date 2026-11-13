@@ -8,7 +8,9 @@ or FPU, no jump table, size and call count within limits), C sources are tried:
     with variants: indexed accesses as arrays, unsigned stores, `int` arguments
     used as pointers, C++ instead of C, explicit casts where the compiler asks,
     dereferences of untyped values (`*temp`, `*(0x10000 + (s32) p)`, `*f(...)`)
-    given the widths the function loads or stores (typed_derefs).
+    given the widths the function loads or stores (typed_derefs), an allocation
+    result kept in a temporary (alloc_temps), pointer sums passed uncast to `void *`
+    parameters (pointer_args).
     m2c also runs with its `mipsee` target ($t0-$t3 renamed $a4-$a7) so that calls
     keep arguments 5-8 (PSP EABI). An `if` whose block returns, followed by a
     `return`, is also tried inverted (mwccpsp keeps the source order of blocks;
@@ -853,12 +855,20 @@ def draft_sources(f: dict, cfg: Config, text: str, ctx: dict[str, str]):
     # signedness, on the first bodies only (each adds a few per site)
     bodies += [b for b0 in bodies[:4] for b in widen_narrow(f["name"], b0) if b not in bodies]
     bodies += [b for b0 in bodies[:6] for b in sign_loads(b0) if b not in bodies]
+    # allocation + inlined constructor: temporary result, word loads, pointer arguments
+    for b0 in bodies[:2]:
+        a = alloc_temps(b0) or b0
+        for b in (a, word_derefs(a)):
+            if b and b not in bodies:
+                bodies.append(b)
+    pairs = [(decls, b) for b in bodies]
+    pairs += [p for b in bodies[:2] + bodies[-4:] if (p := pointer_args(f["name"], decls, b)) and p not in pairs]
     kr = KR_DECL.search("\n".join(decls + bodies))
     for lang in ("c", "cpp"):
         if lang == "cpp" and kr:  # C++ reads `f()` as taking no arguments
             break
-        for b in bodies:
-            yield decls, b, lang
+        for d, b in pairs:
+            yield d, b, lang
 
 
 NEGATED = {"==": "!=", "!=": "==", "<": ">=", ">=": "<", ">": "<=", "<=": ">"}
@@ -1198,6 +1208,99 @@ def widen_narrow(name: str, body: str, limit: int = 4) -> list[str]:
     if len(vars_) > 1:
         out.append(apply(vars_))
     return [b for b in out if b != body]
+
+
+def closing_brace(text: str, i: int) -> int:
+    """Index just past the brace that closes the one at text[i], or -1."""
+    depth = 0
+    for j in range(i, len(text)):
+        depth += {"{": 1, "}": -1}.get(text[j], 0)
+        if not depth:
+            return j + 1
+    return -1
+
+
+def alloc_temps(body: str) -> str | None:
+    """`v = f(...); if (v != 0) { ... } else { v = 0; }` (an allocation followed by an
+    inlined constructor, func_088C354C): the original keeps the `v = 0` of the else
+    block (dead code after a `b`), which m2c's single variable lets the compiler drop.
+    The result goes to a temporary, copied to `v` at the end of the then block."""
+    m = re.search(r"^( *)(\w+) = (\w+\(.*\));\n\1if \(\2 != 0\) \{\n", body, re.M)
+    if not m:
+        return None
+    ind, v = m.group(1), m.group(2)
+    end = closing_brace(body, m.end() - 2)
+    decl = re.search(r"^    (\w+(?: \*+)?) " + v + ";$", body, re.M)
+    if end < 0 or not decl or not re.match(r" else \{\n *" + v + r" = 0;\n *\}", body[end:]) \
+            or re.search(r"\btmp\b", body):
+        return None
+    # `v` must hold the allocation only: no other assignment in the then block
+    if re.search(r"\b" + v + r" (?:[-+*/&|^]|<<|>>)?=(?!=)", body[m.end() - 2:end]):
+        return None
+    block =re.sub(r"\b" + v + r"\b", "tmp", body[m.end() - 2:end - 1])
+    out = (body[:m.start()] + f"{ind}tmp = {m.group(3)};\n{ind}if (tmp != 0) " + block
+           + f"    {ind}{v} = tmp;\n{ind}}}" + body[end:])
+    return out.replace(decl.group(0), decl.group(0) + f"\n    {decl.group(1)} tmp;", 1)
+
+
+def word_derefs(body: str) -> str | None:
+    """`x = *argN;` of a `char *` parameter read as a word (`lw`, func_088C354C)."""
+    out = re.sub(r"= \*(arg\d+);", r"= *(s32 *)\1;", body)
+    return out if out != body else None
+
+
+def extern_params(decl: str, callee: str):
+    """`extern T f(A, B);` -> (head up to the '(', [A, B], tail from the ')'), or None."""
+    m = re.match(r"^extern .*?\b" + callee + r"\(", decl)
+    if not m:
+        return None
+    e = matching(decl, m.end() - 1)
+    if e < 0:
+        return None
+    return decl[:m.end()], split_top(decl[m.end():e - 1], ","), decl[e - 1:]
+
+
+def pointer_args(name: str, decls: list[str], body: str):
+    """A call argument `(int) (argN + K)` or `argN + K` passed to an `s32` parameter:
+    the cast makes mwccpsp compute the sum once and keep it in a saved register, the
+    original recomputes it at each call (func_088C354C). The argument is passed
+    uncast to a `void *` parameter of the callee's extern, and an `s32 argN` of the
+    signature becomes `char *argN`. -> (declarations, body) or None."""
+    externs = {c: k for k, d in enumerate(decls)
+               for c in re.findall(r"\b(func_\w+)\(", d)[:1] if extern_params(d, c)}
+    pointer = re.compile(r"^\(?(arg\d+) \+ ")
+    sites, params, out, pos = set(), set(), body, 0
+    # one call at a time, the text scanned again after each rewrite (nested calls)
+    while (m := re.compile(r"\b(func_\w+)\(").search(out, pos)):
+        pos = m.end()
+        callee, a = m.group(1), m.end() - 1
+        e = matching(out, a)
+        if callee == name or callee not in externs or e < 0:
+            continue
+        args = split_top(out[a + 1:e - 1], ",")
+        new = [re.sub(r"^\((?:int|s32)\) ", "", x) for x in args]
+        hits = [i for i, y in enumerate(new) if pointer.match(y)]
+        if not hits:
+            continue
+        sites |= {(callee, i) for i in hits}
+        params |= {pointer.match(new[i]).group(1) for i in hits}
+        out = out[:a + 1] + ", ".join(args[i] if i not in hits else new[i] for i in range(len(args))) + out[e - 1:]
+    if not sites:
+        return None
+    sig = re.search(r"^.*\b" + name + r"\(([^)]*)\) \{$", out, re.M)
+    if sig:
+        line = sig.group(0)
+        for p in params:
+            line = re.sub(r"\bs32 " + p + r"\b", "char *" + p, line)
+        out = out[:sig.start()] + line + out[sig.end():]
+    new_decls = list(decls)
+    for callee, i in sites:
+        k = externs[callee]
+        head, ps, tail = extern_params(new_decls[k], callee)
+        if i < len(ps):
+            ps[i] = "void *"
+        new_decls[k] = head + ", ".join(ps) + tail
+    return new_decls, out
 
 
 LOAD_TYPES = {"lb": "s8", "lbu": "u8", "lh": "s16", "lhu": "u16", "lw": "s32",
