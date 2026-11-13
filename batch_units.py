@@ -365,7 +365,7 @@ def compile_source(cfg: Config, src: str, lang: str, fix_casts: bool = True):
     pending, last = [], None
     with tempfile.TemporaryDirectory() as t:
         p, o = os.path.join(t, "u." + lang), os.path.join(t, "u.o")
-        for _ in range(16):
+        for _ in range(48):
             Path(p).write_text(src, encoding="utf-8")
             r = subprocess.run([*cfg.cc, "-c", *cfg.flags, "-o", o, p], capture_output=True, text=True,
                                cwd=t, env={**os.environ, "MWCIncludes": "."})
@@ -374,6 +374,34 @@ def compile_source(cfg: Config, src: str, lang: str, fix_casts: bool = True):
             msg = r.stdout + r.stderr
             m = re.search(r"#\s+(\d+):.*?illegal implicit conversion from '([^']*)' to\s*#\s*'([^']*)'",
                           msg, re.S)
+            if fix_casts and not m and (c := CALL_MISMATCH.search(msg)):
+                ln = int(c.group(1)) - 1
+                key = (ln, "call", c.group(2))
+                if key == last:  # the last fill did not remove the error: next one
+                    if not pending:
+                        break
+                    src = pending.pop(0)
+                    continue
+                lines = src.split("\n")
+                fills = call_fills(lines, ln, c.group(2), n_types(c.group(3)), n_types(c.group(4)))
+                if not fills:
+                    break
+                srcs = ["\n".join(lines[:ln] + [x] + lines[ln + 1:]) for x in fills]
+                src, pending, last = srcs[0], srcs[1:] + pending, key
+                continue
+            if fix_casts and not m and (c := ILLEGAL_OPS.search(msg)):
+                ln = int(c.group(1)) - 1
+                key = (ln, "ops", c.group(2))
+                if key == last:
+                    if not pending:
+                        break
+                    src = pending.pop(0)
+                    continue
+                srcs = int_operands(src, ln)
+                if not srcs:
+                    break
+                src, pending, last = srcs[0], srcs[1:] + pending, key
+                continue
             if not (fix_casts and m):
                 break
             ln, frm, to = int(m.group(1)) - 1, m.group(2), m.group(3)
@@ -392,6 +420,105 @@ def compile_source(cfg: Config, src: str, lang: str, fix_casts: bool = True):
             srcs = ["\n".join(lines[:ln] + [c] + lines[ln + 1:]) for c in cands]
             src, pending, last = srcs[0], srcs[1:], (ln, frm, to)
     return None, src, msg
+
+
+# mwcc: the argument types of a call, then the prototype it does not match (both may
+# wrap onto `#   ` continuation lines)
+_TYPES = r"((?:[^)]|\)(?!'))*)"
+CALL_MISMATCH = re.compile(r"#\s+(\d+):[^\n]*\n#\s+Error:[^\n]*\n#\s+function call '(\w+)\(" + _TYPES
+                           + r"\)' does not match\s*#\s*'\w+\(" + _TYPES + r"\)'")
+
+
+def n_types(text: str) -> int:
+    text = re.sub(r"\s*\n#\s*", " ", text).strip()
+    if text in ("", "void"):
+        return 0
+    depth, n = 0, 1
+    for c in text:
+        depth += {"(": 1, ")": -1}.get(c, 0)
+        n += c == "," and not depth
+    return n
+
+
+def call_fills(lines: list[str], ln: int, fname: str, given: int, wanted: int) -> list[str]:
+    """Lines with the call to `fname` on line `ln` given `wanted` arguments instead of
+    `given`. m2c leaves out arguments the caller passes on unchanged (`$a0` still
+    holding its own first argument) and those it passes on the stack: each missing
+    one is tried at each position, as the caller's argument of the same index, then
+    as 0. Extra arguments are dropped from the end."""
+    line = lines[ln]
+    for m in re.finditer(r"\b" + fname + r"\(", line):
+        close = matching(line, m.end() - 1)
+        if close < 0:
+            continue
+        inner = line[m.end():close - 1]
+        args, k, depth = [], 0, 0
+        for j, c in enumerate(inner + ","):
+            depth += {"(": 1, "[": 1, ")": -1, "]": -1}.get(c, 0)
+            if c == "," and not depth:
+                args.append(inner[k:j].strip())
+                k = j + 1
+        if args == [""]:
+            args = []
+        if len(args) == given:
+            break
+    else:
+        return []
+    head = next((h for h in (re.match(r"^\w[\w *]*?\b\w+\(([^)]*)\) \{$", lines[i]) for i in range(ln, -1, -1))
+                 if h), None)
+    params = set(re.findall(r"\b(arg\d+)\s*(?:,|$)", head.group(1))) if head else set()
+
+    def call(a):
+        return line[:m.end()] + ", ".join(a) + line[close - 1:]
+    if wanted < given:
+        return [call(args[:wanted])]
+    d = wanted - given
+    spots = list(itertools.combinations(range(wanted), d))
+    # the missing ones together at the end or at the start first
+    spots.sort(key=lambda s: (s != tuple(range(given, wanted)), s != tuple(range(d)), s))
+    out = []
+    for s in spots:
+        for zeros in itertools.product((False, True), repeat=d):
+            vals = [("0" if z or f"arg{p}" not in params else f"arg{p}") for p, z in zip(s, zeros)]
+            it, filled = iter(args), []
+            for p in range(wanted):
+                filled.append(vals[s.index(p)] if p in s else next(it))
+            text = call(filled)
+            if text not in out:
+                out.append(text)
+    return out[:24]
+
+
+# mwcc: an arithmetic operator given a pointer (caret at the end of the expression)
+ILLEGAL_OPS = re.compile(r"#\s+(\d+):[^\n]*\n#\s+Error:[^\n]*\n#\s+illegal operands ('[^']*\*' \S+ '[^']*'"
+                         r"|'[^']*' \S+ '[^']*\*')")
+
+
+def int_operands(src: str, ln: int) -> list[str]:
+    """Sources with one pointer or array name of line `ln` read as an integer: m2c
+    types as `char *` a value the code also masks, scales or subtracts from
+    (`arg1 & 0xFF`, `i - D_X`). A `char *` parameter or local is first declared
+    `s32`; then each occurrence alone is cast, then every occurrence of the name."""
+    lines = src.split("\n")
+    line = lines[ln]
+    ptrs = set(re.findall(r"\*\s*(\w+)\s*(?=[,;)=\[])", src))
+    ptrs |= set(re.findall(r"^\s*(?:extern\s+)?\w[\w ]*?\b(\w+)\[[^\]]*\];", src, re.M))
+    name_at = r"(?<![\w.>*])" + "{}" + r"\b(?!\s*\()"  # not a member, a dereference or a call
+    names = [n for n in dict.fromkeys(re.findall(name_at.format(r"([A-Za-z_]\w*)"), line)) if n in ptrs]
+    head = next((k for k in range(ln, -1, -1) if re.match(r"^\w[\w *]*?\b\w+\(.*\) \{$", lines[k])), 0)
+    above, below = "\n".join(lines[:head]), "\n".join(lines[head:])
+    retyped, cast = [], []
+    for n in names:
+        # a parameter of the enclosing function, or one of its locals
+        decl = re.compile(r"(^\w[\w *]*?\b\w+\((?:[^)]*,\s*)?|^\s+)char \*" + n + r"\b(?=[,);])", re.M)
+        if decl.search(below):
+            retyped.append(above + ("\n" if above else "") + decl.sub(lambda m: m.group(1) + "s32 " + n, below, 1))
+        occ = [m.start() for m in re.finditer(name_at.format(n), line)]
+        for i in occ:
+            cast.append(line[:i] + f"(s32) {n}" + line[i + len(n):])
+        if len(occ) > 1:
+            cast.append(re.sub(name_at.format(n), f"(s32) {n}", line))
+    return retyped + ["\n".join(lines[:ln] + [x] + lines[ln + 1:]) for x in cast[:12]]
 
 
 def call_casts(line: str, msg: str, frm: str, to: str) -> list[str]:
@@ -1522,8 +1649,13 @@ def grow_buffer(cfg: Config, f: dict, body: str):
         if size > SIZES.get(m.group(1), 4)]
 
 
+def state_rank(state: str) -> int:
+    return next((i for i, k in enumerate(("differs", "length")) if state.startswith(k)), 2)
+
+
 def solve(f: dict, cfg: Config, callees: Callees, verbose: bool = False):
-    """-> (state, source, lang) of the first matching source, else the first try."""
+    """-> (state, source, lang) of the first matching source, else of the closest try
+    (the first that differs, else the first of the wrong length, else the first)."""
     first = None
     for decls, body, lang in candidates(f, cfg, callees):
         state, src, err = try_source(cfg, f["name"], f["size"], decls, body, lang)
@@ -1546,7 +1678,8 @@ def solve(f: dict, cfg: Config, callees: Callees, verbose: bool = False):
             print(f"--- {lang}: {state}\n{src}{err[-400:]}")
         if state == "OK":
             return state, src, lang
-        first = first or (state, src, lang)
+        if first is None or state_rank(state) < state_rank(first[0]):
+            first = (state, src, lang)
     return first or ("no draft", "", "c")
 
 
