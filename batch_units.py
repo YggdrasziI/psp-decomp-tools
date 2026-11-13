@@ -10,7 +10,8 @@ or FPU, no jump table, size and call count within limits), C sources are tried:
     dereferences of untyped values (`*temp`, `*(0x10000 + (s32) p)`, `*f(...)`)
     given the widths the function loads or stores (typed_derefs), an allocation
     result kept in a temporary (alloc_temps), pointer sums passed uncast to `void *`
-    parameters (pointer_args).
+    parameters (pointer_args), structure array elements `&((E<K> *) (p + off))[i]`
+    (stride_arrays).
     m2c also runs with its `mipsee` target ($t0-$t3 renamed $a4-$a7) so that calls
     keep arguments 5-8 (PSP EABI). An `if` whose block returns, followed by a
     `return`, is also tried inverted (mwccpsp keeps the source order of blocks;
@@ -849,6 +850,7 @@ def draft_sources(f: dict, cfg: Config, text: str, ctx: dict[str, str]):
     bodies += [b for b0 in list(bodies) for b in typed_derefs(f, decls, b0)]
     bodies += [b for b0 in list(bodies) for b in stack_arrays(f, b0) if b not in bodies]
     bodies += [b for b0 in list(bodies) for b in pointer_offsets(b0) if b not in bodies]
+    bodies += [b for b0 in bodies[:4] for b in stride_arrays(b0) if b not in bodies]
     bodies += [b for b0 in list(bodies) for b in bool_tests(b0) if b not in bodies]
     bodies += [b for b0 in list(bodies) for b in invert_ifs(b0) if b not in bodies]
     bodies += [b for b0 in list(bodies) for b in narrow_params(f["name"], b0) if b not in bodies]
@@ -1247,6 +1249,67 @@ def word_derefs(body: str) -> str | None:
     """`x = *argN;` of a `char *` parameter read as a word (`lw`, func_088C354C)."""
     out = re.sub(r"= \*(arg\d+);", r"= *(s32 *)\1;", body)
     return out if out != body else None
+
+
+def stride_arrays(body: str) -> list[str]:
+    """`t = (I * K) + B;` then `*(T *)(t + off)` (m2c, func_08830728): the original
+    reads element I of an array of K-byte structures, `*(T *) &((E<K> *) (B + off))[i]`,
+    the index kept in a local (inlined, mwccpsp computes it at each access; as a sum,
+    the `addu` operands come out swapped). The local is tried as `s32` and as the
+    type of a leading cast of I. One body per local type, all such temporaries
+    rewritten; None when a temporary has any other use."""
+    lines = body.split("\n")
+    sites = []
+    for n, l in enumerate(lines):
+        m = re.match(r"^( +)(\w+) = (.+);$", l)
+        if not m:
+            continue
+        rhs = re.sub(r"^\((?:char|void) \*\) ", "", m.group(3))
+        sides = split_top(strip_parens(rhs), "+")
+        if len(sides) != 2:
+            continue
+        prod = split_top(strip_parens(sides[0]), "*")
+        if len(prod) < 2 or not re.fullmatch(r"0x[0-9A-Fa-f]+|\d+", prod[-1]):
+            continue
+        k = int(prod[-1], 0)
+        if k < 2:
+            continue
+        sites.append((n, m.group(1), m.group(2), " * ".join(prod[:-1]), k, sides[1]))
+    if not sites:
+        return []
+    out = []
+    for typed in (False, True):
+        new, ok, declared = list(lines), True, set()
+        for x, (n, ind, t, idx, k, base) in enumerate(sites):
+            cast = re.match(r"^\((s8|u8|s16|u16)\) ", idx)
+            ty = cast.group(1) if typed and cast else "s32"
+            i = f"{t}_i"
+            new[n] = f"{ind}{i} = {idx};"
+            # up to the next assignment of the same temporary (same local index)
+            stop = next((s[0] for s in sites[x + 1:] if s[2] == t), len(new))
+            rest = "\n".join(new[n + 1:stop])
+            rest = re.sub(r"\*\((\w+ \*+)\)\(" + t + r" \+ ([^()]+)\)",
+                          lambda m: f"*({m.group(1)}) &((E{k} *) ({base} + {m.group(2)}))[{i}]", rest)
+            rest = re.sub(r"\*\((\w+ \*+)\)(?:\(" + t + r"\)|" + t + r"\b)",
+                          lambda m: f"*({m.group(1)}) &((E{k} *) ({base}))[{i}]", rest)
+            if re.search(r"\b" + t + r"\b", rest):
+                ok = False
+                break
+            new[n + 1:stop] = rest.split("\n")
+            if t in declared:
+                continue
+            d = next((j for j, l in enumerate(new) if re.match(r"^    \S.* \**" + t + ";$", l)), None)
+            if d is None:
+                ok = False
+                break
+            new[d] = f"    {ty} {i};"
+            declared.add(t)
+        # any use left (before the first assignment, in an index or base): no body
+        if ok and any(re.search(r"\b" + t + r"\b", "\n".join(new)) for t in declared):
+            ok = False
+        if ok and (b := "\n".join(new)) not in out:
+            out.append(b)
+    return out
 
 
 def extern_params(decl: str, callee: str):
