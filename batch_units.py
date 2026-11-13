@@ -850,6 +850,9 @@ def draft_sources(f: dict, cfg: Config, text: str, ctx: dict[str, str]):
     bodies += [b for b0 in list(bodies) for b in bool_tests(b0) if b not in bodies]
     bodies += [b for b0 in list(bodies) for b in invert_ifs(b0) if b not in bodies]
     bodies += [b for b0 in list(bodies) for b in narrow_params(f["name"], b0) if b not in bodies]
+    # signedness, on the first bodies only (each adds a few per site)
+    bodies += [b for b0 in bodies[:4] for b in widen_narrow(f["name"], b0) if b not in bodies]
+    bodies += [b for b0 in bodies[:6] for b in sign_loads(b0) if b not in bodies]
     kr = KR_DECL.search("\n".join(decls + bodies))
     for lang in ("c", "cpp"):
         if lang == "cpp" and kr:  # C++ reads `f()` as taking no arguments
@@ -1140,6 +1143,61 @@ def pointer_offsets(body: str) -> list[str]:
         out = out[:start] + new + out[end:]
         i = start + len(new)
     return [out] if out != body else []
+
+
+NARROW = {"s8": "u8", "u8": "s8", "s16": "u16", "u16": "s16"}
+
+
+def sign_loads(body: str, limit: int = 4) -> list[str]:
+    """m2c guesses the sign of a byte or halfword load from its uses; the original may
+    load the other way (`lbu` for `lb`, func_08823C84, func_088A9FF8). Each typed load
+    `*(u8 *)(...)` gets the other sign, and a symbol m2c left as `char`, `*(&D_X + i)`,
+    is read through `(u8 *)` or `(s8 *)`. Stores are left alone (same instruction).
+    One body per site (the first `limit`), and one with all of them."""
+    sites = []
+    for m in re.finditer(r"\*\((s8|u8|s16|u16) \*\)\(", body):
+        end = matching(body, m.end() - 1)
+        if end > 0 and not re.match(r" =[^=]", body[end:]):
+            sites.append((m.start() + 2, m.start() + 2 + len(m.group(1)), NARROW[m.group(1)]))
+    for m in re.finditer(r"\*\(&(D_\w+) \+ ", body):
+        for t in ("u8", "s8"):
+            sites.append((m.start() + 2, m.start() + 3 + len(m.group(1)), f"({t} *)&{m.group(1)}"))
+
+    def apply(chosen):
+        b = body
+        for a, e, new in sorted(chosen, reverse=True):
+            b = b[:a] + new + b[e:]
+        return b
+    out = [apply([s]) for s in sites[:limit]]
+    if len(sites) > 1:
+        # one site per position for the combined body
+        out.append(apply(list({a: (a, e, n) for a, e, n in sites}.values())))
+    return out
+
+
+def widen_narrow(name: str, body: str, limit: int = 4) -> list[str]:
+    """m2c types as `s8` / `s16` a counter or parameter that the original kept in an
+    `int`, truncated only where it is stored or passed (extra `seb` / `seh`,
+    func_08891B14, func_088D5C34); or the original narrowed at a call a parameter m2c
+    declared narrow (func_08865F68). Each such local or parameter is made `s32`; a
+    call argument `(s32) v` becomes `(T) v`. One body per variable, and one with all."""
+    sig = re.search(r"^.*\b" + name + r"\(([^)]*)\) \{$", body, re.M)
+    vars_ = [(m.group(1), m.group(2)) for m in re.finditer(r"^    (s8|u8|s16|u16) (\w+);$", body, re.M)]
+    if sig:
+        vars_ += re.findall(r"\b(s8|u8|s16|u16) (arg\d+)\b", sig.group(1))
+
+    def apply(chosen):
+        b = body
+        for t, v in chosen:
+            b = re.sub(r"^    " + t + " " + v + ";$", f"    s32 {v};", b, flags=re.M)
+            if v.startswith("arg") and (s := re.search(r"^.*\b" + name + r"\(([^)]*)\) \{$", b, re.M)):
+                b = b[:s.start()] + re.sub(r"\b" + t + " " + v + r"\b", f"s32 {v}", s.group(0)) + b[s.end():]
+            b = re.sub(r"(?<=\w\()\(s32\) " + v + r"\b|(?<=, )\(s32\) " + v + r"\b", f"({t}) {v}", b)
+        return b
+    out = [apply([v]) for v in vars_[:limit]]
+    if len(vars_) > 1:
+        out.append(apply(vars_))
+    return [b for b in out if b != body]
 
 
 LOAD_TYPES = {"lb": "s8", "lbu": "u8", "lh": "s16", "lhu": "u16", "lw": "s32",
