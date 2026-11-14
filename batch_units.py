@@ -13,7 +13,8 @@ no jump table, size and call count within limits), C sources are tried:
     parameters (pointer_args), structure array elements `&((E<K> *) (p + off))[i]`
     (stride_arrays), `goto`s of merged block tails written out (inline_gotos), and,
     compiled as C++ only, calls through a vtable slot (`jalr $t9`) written as virtual
-    calls (virtual_calls).
+    calls (virtual_calls); floats copied as a group made one structure (float_structs).
+    Drafts that dereference a raw module address are dropped (name it first).
     m2c also runs with its `mipsee` target ($t0-$t3 renamed $a4-$a7) so that calls
     keep arguments 5-8 (PSP EABI). An `if` whose block returns, followed by a
     `return`, is also tried inverted (mwccpsp keeps the source order of blocks;
@@ -386,10 +387,76 @@ def convert(name: str, text: str, array):
 
 # ---------------------------------------------------------------- compile and compare
 
+ABS_ADDR = re.compile(r"\(\w+ \*+\) ?0x0[89][0-9A-F]{6}\b")
+FIELDS = "abcdefgh"
+FLOAT_AT = re.compile(r"\*\(f32 \*\)\(\(char \*\)\(&(D_\w+)\) \+ (0x[0-9A-F]+|\d+)\)")
+FLOAT_LOCAL = re.compile(r"^    f32 sp([0-9A-F]+);$", re.M)
+
+
+def float_runs(body: str) -> list[list[int]]:
+    """Runs of float stack locals 4 bytes apart whose first one's address is taken."""
+    runs, cur = [], []
+    for o in sorted(int(x, 16) for x in FLOAT_LOCAL.findall(body)):
+        if cur and o == cur[-1] + 4:
+            cur.append(o)
+            continue
+        runs.append(cur)
+        cur = [o]
+    runs.append(cur)
+    return [r for r in runs if 1 < len(r) <= len(FIELDS) and f"&sp{r[0]:X}" in body]
+
+
+def float_structs(decls: list[str], body: str):
+    """Floats copied as a group (a 12-byte pointer-to-member constant, a vector): m2c
+    gives each word its own stack local (`f32 sp14, sp18, sp1C`, `&sp14` passed on)
+    and reads the words of a symbol as `*(f32 *)((char *)(&D_X) + 4)`. mwccpsp gives
+    each word its own `lui` only when the symbol is a structure (`D_X.b`), and copies a
+    structure through float registers: the locals become one `F<n>` structure, and a
+    store of all its words in a row one structure store (func_0885AA7C).
+    -> (decls, body) or None."""
+    # symbols read word by word, declared `char`, become structures
+    offs = {}
+    for m in FLOAT_AT.finditer(body):
+        offs.setdefault(m.group(1), set()).add(int(m.group(2), 0))
+    out_decls = list(decls)
+    for sym, os_ in offs.items():
+        n = max(os_) // 4 + 1
+        if any(o % 4 for o in os_) or n > len(FIELDS) or f"extern char {sym};" not in out_decls:
+            return None
+        out_decls[out_decls.index(f"extern char {sym};")] = f"extern F{n} {sym};"
+    b = FLOAT_AT.sub(lambda m: f"{m.group(1)}.{FIELDS[int(m.group(2), 0) // 4]}", body)
+    for r in float_runs(b):
+        names = [f"sp{o:X}" for o in r]
+        n, first = len(r), names[0]
+        # a store of each word in a row, at consecutive offsets of one base
+        store = re.compile(r"^( +)\*\(f32 \*\)\((.+?) \+ (0x[0-9A-F]+|\d+)\) = " + first + r";\n"
+                           + "".join(r"\1\*\(f32 \*\)\(\2 \+ (0x[0-9A-F]+|\d+)\) = " + nm + r";\n"
+                                     for nm in names[1:]), re.M)
+
+        def whole(m, n=n, first=first):
+            o = [int(x, 0) for x in m.groups()[2:]]
+            if any(o[i] != o[0] + 4 * i for i in range(n)):
+                return m.group(0)
+            return f"{m.group(1)}*(F{n} *)({m.group(2)} + 0x{o[0]:X}) = {first};\n"
+        b = store.sub(whole, b)
+        b = re.sub(r"^    f32 " + first + ";$", f"    F{n} {first};", b, flags=re.M)
+        for k, nm in enumerate(names[1:], 1):
+            b = re.sub(r"^    f32 " + nm + r";\n", "", b, flags=re.M)
+            b = re.sub(r"\b" + nm + r"\b", f"{first}.{FIELDS[k]}", b)
+        # the first word, but where the whole structure is meant
+        b = re.sub(r"(?<![&.\w])" + first + r"\b(?![.;\w])", first + ".a", b)
+        b = re.sub(r"^( +)" + first + r" = ", r"\1" + first + ".a = ", b, flags=re.M)
+    if b == body and out_decls == decls:
+        return None
+    return out_decls, b
+
+
 def typedefs(src: str) -> list[str]:
     tds = [f"typedef {v} {k};" for k, v in TYPES.items() if re.search(r"\b" + k + r"\b", src)]
     strides = sorted({int(x) for x in re.findall(r"\bE(\d+)\b", src)})
-    return tds + [f"typedef struct {{ char b[{k}]; }} E{k};" for k in strides]
+    floats = sorted({int(x) for x in re.findall(r"\bF(\d)\b", src)})
+    return (tds + [f"typedef struct {{ char b[{k}]; }} E{k};" for k in strides]
+            + [f"typedef struct {{ f32 {', '.join(FIELDS[:k])}; }} F{k};" for k in floats])
 
 
 def assemble_source(decls: list[str], body: str, lang: str) -> str:
@@ -1061,12 +1128,14 @@ def draft_sources(f: dict, cfg: Config, text: str, ctx: dict[str, str], langs=("
                 bodies.append(b)
     pairs = [(decls, b) for b in bodies]
     pairs += [p for b in bodies[:3] + bodies[-6:] if (p := pointer_args(f["name"], decls, b)) and p not in pairs]
+    pairs += [p for d, b in pairs[:6] if (p := float_structs(d, b)) and p not in pairs]
     kr = KR_DECL.search("\n".join(decls + bodies))
     for lang in langs:
         if lang == "cpp" and kr:  # C++ reads `f()` as taking no arguments
             break
         for d, b in pairs:
-            yield d, b, lang
+            if not ABS_ADDR.search(b):  # an address splat left raw: name it first
+                yield d, b, lang
 
 
 NEGATED = {"==": "!=", "!=": "==", "<": ">=", ">=": "<", ">": "<=", "<=": ">"}
