@@ -13,10 +13,13 @@ no jump table, size and call count within limits), C sources are tried:
     parameters (pointer_args), structure array elements `&((E<K> *) (p + off))[i]`
     (stride_arrays), `goto`s of merged block tails written out (inline_gotos), and,
     compiled as C++ only, calls through a vtable slot (`jalr $t9`) written as virtual
-    calls (virtual_calls); floats copied as a group made one structure (float_structs).
+    calls (virtual_calls); floats copied as a group made one structure (float_structs),
+    a structure copied to the stack through float registers and read field by field
+    (stack_copies), m2c's float to unsigned conversions written `(u32) x`
+    (unsigned_casts). `ext` is given to m2c as `srl` + `andi` (expand_ext).
     Drafts that dereference a raw module address are dropped (name it first).
     m2c also runs with its `mipsee` target ($t0-$t3 renamed $a4-$a7) so that calls
-    keep arguments 5-8 (PSP EABI). An `if` whose block returns, followed by a
+    keep arguments 5-8 and float arguments $f12-$f19 are their own (PSP EABI). An `if` whose block returns, followed by a
     `return`, is also tried inverted (mwccpsp keeps the source order of blocks;
     comparisons are negated by their operator, `!(a < b)` compiles differently).
     m2c is given the prototypes of the functions already declared in src/ as
@@ -29,7 +32,8 @@ no jump table, size and call count within limits), C sources are tried:
     (argument registers $a0-$a3, $t0-$t3 read before written, straight-line scan
     with delay slots, following tail jumps);
   - for straight-line functions that end in a tail jump (`j f` + delay slot), a
-    source written from the assembly (m2c misses the delay-slot arguments).
+    source written from the assembly (m2c misses the delay-slot arguments), float
+    arguments included.
 
 Each source is compiled with the [compiler] of decomp.toml and compared with the
 original: same length, same instructions, relocated fields masked but checked when
@@ -91,6 +95,7 @@ SKIP_OPS = re.compile(r"^(jalr|\.word)")
 KR_DECL = re.compile(r"^(?:extern )?\w[\w ]*?\**\s*(\w+)\(\);$", re.M)
 # argument registers, EABI: $a0-$a3 then $t0-$t3
 AREGS = ["$a0", "$a1", "$a2", "$a3", "$t0", "$t1", "$t2", "$t3"]
+FARGS = [f"$f{i}" for i in range(12, 20)]  # float arguments, EABI
 NO_DEST = {"mult", "multu", "div", "divu", "madd", "maddu", "msub", "msubu", "mthi", "mtlo"}
 ADDR_SYM = re.compile(r"_([0-9A-F]{8})$")
 
@@ -164,11 +169,45 @@ def known_prototypes() -> dict[str, str]:
 EE_REGS = {**{f"t{i}": f"a{i + 4}" for i in range(4)}, **{f"t{i}": f"t{i - 4}" for i in range(4, 8)}}
 
 
+INSN_LINE = re.compile(r"^\s*(\w+(?:\.\w+)*)\s*(.*)$")
+EXT = re.compile(r"^(\s*)ext\s+(\$\w+),\s*(\$\w+),\s*(0x[0-9A-Fa-f]+|\d+),\s*(0x[0-9A-Fa-f]+|\d+)\s*$")
+
+
+def expand_ext(lines: list[str]) -> list[str]:
+    """`ext rd, rs, pos, size` (MIPS32r2, unknown to m2c) -> `srl rd, rs, pos; andi rd,
+    rd, mask`, which m2c reads as `(rs >> pos) & mask` (mwccpsp gives `ext` back). In the
+    delay slot of a jump or of a branch that is not likely and does not read rd, the
+    pair goes before it (the slot gets a nop); other ones are left (m2c then fails)."""
+    out = []
+    for l in lines:
+        m = EXT.match(l)
+        size = int(m.group(5), 0) if m else 0
+        if not m or not 0 < size <= 16:
+            out.append(l)
+            continue
+        ind, rd, rs, pos = m.group(1), m.group(2), m.group(3), int(m.group(4), 0)
+        pair = [f"{ind}srl {rd}, {rs}, {pos}", f"{ind}andi {rd}, {rd}, {(1 << size) - 1:#x}"]
+        prev = next((k for k in range(len(out) - 1, -1, -1) if INSN_LINE.match(out[k])
+                     and not out[k].strip().startswith((".", "glabel", "/*")) and out[k].strip()
+                     and not out[k].rstrip().endswith(":")), None)
+        pm = INSN_LINE.match(out[prev]) if prev is not None else None
+        op = pm.group(1) if pm else ""
+        if op.startswith(("b", "j")) and op != "break":
+            if op.endswith("l") and op not in ("jal",) or (op not in ("j", "jal") and rd in pm.group(2)):
+                out.append(l)
+                continue
+            out[prev:prev] = pair
+            out.append(f"{ind}nop")
+            continue
+        out += pair
+    return out
+
+
 def m2c_draft(f: dict, protos: dict[str, str] | None = None, eabi: bool = False) -> str:
     """m2c output; the prototypes of the functions it calls are given as context.
     eabi: `mipsee` target, so that calls keep their arguments in $t0-$t3."""
-    src = ".set noat\n.set noreorder\n.section .text\n" + "\n".join(
-        re.sub(r"/\* [0-9A-F ]+\*/", "", l) for l in f["lines"] if not l.startswith("nonmatching")) + "\n"
+    src = ".set noat\n.set noreorder\n.section .text\n" + "\n".join(expand_ext(
+        [re.sub(r"/\* [0-9A-F ]+\*/", "", l) for l in f["lines"] if not l.startswith("nonmatching")])) + "\n"
     if eabi:
         src = re.sub(r"\$(t[0-7])\b", lambda m: "$" + EE_REGS[m.group(1)], src)
     with tempfile.TemporaryDirectory() as t:
@@ -451,12 +490,132 @@ def float_structs(decls: list[str], body: str):
     return out_decls, b
 
 
+INT_TYPES = ("s8", "u8", "s16", "u16", "s32", "u32")
+
+
+def copy_groups(ins: list) -> list[int]:
+    """Sizes in words of the copies through float registers: runs of `lwc1` each
+    followed by as many `swc1` (other instructions may sit in between)."""
+    out, loads, stores = [], 0, 0
+    for op, _ in ins:
+        if op == "lwc1":
+            if stores:
+                if stores == loads:
+                    out.append(loads)
+                loads, stores = 0, 0
+            loads += 1
+        elif op == "swc1" and loads:
+            stores += 1
+    if loads and stores == loads:
+        out.append(loads)
+    return out
+
+
+def split_copy(n: int, groups: list[int]) -> list[int]:
+    """How mwccpsp copied n words: one structure up to 4 words (16 bytes, through float
+    registers; it copies larger ones in a loop), else one copy per member as the
+    assembly shows them (consecutive groups that add up to n), else []."""
+    if n <= 4:
+        return [n]
+    for i in range(len(groups)):
+        for j in range(i + 2, len(groups) + 1):
+            if sum(groups[i:j]) == n and all(g <= 4 for g in groups[i:j]):
+                return groups[i:j]
+    return []
+
+
+def stack_copies(decls: list[str], body: str, groups: list[int] = ()):
+    """A structure copied to the stack and then read field by field: mwccpsp copies it
+    word by word through float registers (`lwc1`/`swc1`), so m2c types its words as
+    float locals assigned in a row (`sp1C = *(f32 *)(arg0 + 0); sp20 = ...`) and reads
+    the integer fields as conversions (`(s8) sp28` for an `lb`). The run becomes one
+    `F<n>` structure copy (over 4 words, one copy per member: `C3_2` holds an `F3` and
+    an `F2`, sizes from copy_groups), its words read in place (`*(s8 *)&cp1C.p1.a`;
+    func_0889A09C). -> (decls, body) or None."""
+    # `f32 sp1C;` / `char *sp24;` and `sp24 = *(char **)(p + 8);`: type `char *`
+    local = dict((m.group(2), m.group(1)) for m in
+                 re.finditer(r"^    (\w+(?: \*+)?) ?(sp[0-9A-F]+);$", body, re.M))
+    line = re.compile(r"^    (sp[0-9A-F]+) = \*\((\w+(?: \*+)?) ?\*\)\((.+?) \+ (0x[0-9A-F]+|\d+)\);$", re.M)
+    lines = body.split("\n")
+    b, done = body, False
+    i = 0
+    while i < len(lines):
+        run = []
+        for x in lines[i:]:
+            m = line.match(x)
+            if not m or m.group(1) not in local or local[m.group(1)] != m.group(2):
+                break
+            if run:
+                p = run[-1]
+                if (m.group(3) != p.group(3) or int(m.group(4), 0) != int(p.group(4), 0) + 4
+                        or int(m.group(1)[2:], 16) != int(p.group(1)[2:], 16) + 4):
+                    break
+            run.append(m)
+        i += max(len(run), 1)
+        names = [m.group(1) for m in run]
+        parts = split_copy(len(run), list(groups))
+        if len(run) < 2 or not parts or "f32" not in (local[n] for n in names) \
+                or any("&" + n in b or local[n] in ("f64", "s64", "u64") for n in names):
+            continue
+        cp, src = "cp" + names[0][2:], f"({run[0].group(3)} + {run[0].group(4)})"  # a new name
+        if len(parts) == 1:
+            st = f"F{parts[0]}"
+            copy = f"    {cp} = *({st} *){src};"
+            flds = [f"{cp}.{FIELDS[k]}" for k in range(len(run))]
+        else:
+            st = "C" + "_".join(map(str, parts))
+            copy = "\n".join(f"    {cp}.p{j} = (({st} *){src})->p{j};" for j in range(len(parts)))
+            flds = [f"{cp}.p{j}.{FIELDS[k]}" for j, g in enumerate(parts) for k in range(g)]
+        b = b.replace("\n".join(m.group(0) for m in run), copy, 1)
+        b = re.sub(r"^    " + re.escape(local[names[0]]) + " ?" + names[0] + r";$",
+                   f"    {st} {cp};", b, count=1, flags=re.M)
+        for k, nm in enumerate(names):
+            t, fld = local[nm], flds[k]
+            if k:
+                b = re.sub(r"^    " + re.escape(t) + " ?" + nm + r";\n", "", b, flags=re.M)
+            if t == "f32":
+                b = re.sub(r"\((" + "|".join(INT_TYPES) + r")\) " + nm + r"\b", rf"*(\1 *)&{fld}", b)
+                b = re.sub(r"(?<![.\w])" + nm + r"\b(?![.\w])", fld, b)
+            else:
+                b = re.sub(r"(?<![.\w])" + nm + r"\b(?![.\w])", f"(*({t} *)&{fld})", b)
+        done = True
+    return (decls, b) if done else None
+
+
+UNSIGNED_CONV = re.compile(
+    r"^( +)if \((?:(!)\((.+?)|(?!!)(.+?)) >= 2\.1474836e9f\)?\) \{\n +(\w+) = \(s32\) (.+?);\n"
+    r" +\} else \{\n +\5 = \(s32\) (.+?);\n +\}$", re.M)
+
+
+def unsigned_casts(body: str) -> list[str]:
+    """m2c writes the float to unsigned conversion of mwccpsp (`c.le.s` with 2^31, two
+    `trunc.w.s`) out as `if (x >= 2.1474836e9f) v = (s32) (x - 2.1474836e9f) | ~0x7FFF;
+    else v = (s32) x;`: the source was `v = (u32) x` (func_0884424C)."""
+    def conv(m):
+        neg = bool(m.group(2))
+        if neg != m.group(0).split("\n")[0].endswith(")) {"):
+            return m.group(0)
+        x = m.group(3) if neg else m.group(4)
+        hi, lo = (m.group(6), m.group(7)) if not neg else (m.group(7), m.group(6))
+        if lo.strip("()") != x.strip("()") or not re.fullmatch(
+                r"\(" + re.escape(x) + r" - 2\.1474836e9f\) \| ~0x7FFF", hi):
+            return m.group(0)
+        return f"{m.group(1)}{m.group(5)} = (u32) {x};"
+    b = UNSIGNED_CONV.sub(conv, body)
+    return [b] if b != body else []
+
+
 def typedefs(src: str) -> list[str]:
-    tds = [f"typedef {v} {k};" for k, v in TYPES.items() if re.search(r"\b" + k + r"\b", src)]
+    copies = sorted(set(re.findall(r"\bC(\d(?:_\d)+)\b", src)))  # see stack_copies
+    floats = sorted({int(x) for x in re.findall(r"\bF(\d)\b", src)}
+                    | {int(g) for c in copies for g in c.split("_")})
+    tds = [f"typedef {v} {k};" for k, v in TYPES.items()
+           if re.search(r"\b" + k + r"\b", src) or (k == "f32" and floats)]  # F<n> uses f32
     strides = sorted({int(x) for x in re.findall(r"\bE(\d+)\b", src)})
-    floats = sorted({int(x) for x in re.findall(r"\bF(\d)\b", src)})
     return (tds + [f"typedef struct {{ char b[{k}]; }} E{k};" for k in strides]
-            + [f"typedef struct {{ f32 {', '.join(FIELDS[:k])}; }} F{k};" for k in floats])
+            + [f"typedef struct {{ f32 {', '.join(FIELDS[:k])}; }} F{k};" for k in floats]
+            + ["typedef struct { " + " ".join(f"F{g} p{j};" for j, g in enumerate(c.split("_")))
+               + f" }} C{c};" for c in copies])
 
 
 def assemble_source(decls: list[str], body: str, lang: str) -> str:
@@ -847,6 +1006,34 @@ class Callees:
             step(op, ops)
         return max([AREGS.index(r) + 1 for r in read] + [0])
 
+    def freads(self, name: str, depth: int = 0):
+        """Float argument registers ($f12-$f19) read anywhere before written, as
+        reads() does for the integer ones: a lower bound of the float argument count."""
+        ins = self.ins.get(name)
+        if not ins or depth > 3:
+            return None
+        written, read = set(), set()
+
+        def step(op, ops):
+            if not ops or op in ("jal", "jr", "j") or op.startswith("bc1"):
+                return
+            if op.startswith(("swc1", "c.", "mtc1")) or op.startswith("b") or op in ("sw", "sh", "sb"):
+                srcs, dst = (ops[:1], ops[1:]) if op == "mtc1" else (ops, [])
+            else:
+                srcs, dst = ops[1:], ops[:1]
+            read.update(r for r in regs_of(srcs) if r in FARGS and r not in written)
+            written.update(regs_of(dst))
+
+        for k, (op, ops) in enumerate(ins):
+            if op == "j" and ops and ops[0].startswith("func_"):
+                if k + 1 < len(ins):
+                    step(*ins[k + 1])
+                n = self.freads(ops[0], depth + 1) or 0
+                read.update(r for r in FARGS[:n] if r not in written)
+                continue
+            step(op, ops)
+        return max([FARGS.index(r) + 1 for r in read] + [0])
+
     @staticmethod
     def variadic(ins) -> bool:
         """A variadic function stores the unnamed argument registers, up to $t3, on
@@ -901,7 +1088,8 @@ def tail_sources(f: dict, callees: Callees):
         return []
     regs = {r: ("arg", i) for i, r in enumerate(AREGS)}
     regs["$zero"] = ("imm", 0)
-    used, ptr, stmts, globs = set(), set(), [], {}
+    regs.update({r: ("farg", i) for i, r in enumerate(FARGS)})  # float arguments, apart
+    used, ptr, stmts, globs, fused = set(), set(), [], {}, set()
 
     def hexs(n):
         return f"{n:#x}" if n > 9 else str(n) if n >= 0 else f"-{-n:#x}"
@@ -915,6 +1103,9 @@ def tail_sources(f: dict, callees: Callees):
             if v[0] == "arg":
                 return f"arg{v[1]}"
             return f"arg{v[1]} + {v[2]:#x}" if v[2] >= 0 else f"arg{v[1]} - {-v[2]:#x}"
+        if v[0] == "farg":
+            fused.add(v[1])
+            return f"farg{v[1]}"
         if v[0] == "imm":
             return hexs(v[1])
         if v[0] == "expr":
@@ -996,6 +1187,10 @@ def tail_sources(f: dict, callees: Callees):
                     regs[o[0]] = ("expr", f"{ex(o[1])} + {ex(o[2])}")
             elif op in LOADS:
                 regs[o[0]] = ("expr", lval(mem(o[1]), LOADS[op]))
+            elif op == "lwc1":  # a float argument loaded in the delay slot (func_088160E8)
+                regs[o[0]] = ("expr", lval(mem(o[1]), "f32"))
+            elif op == "mov.s":
+                regs[o[0]] = regs[o[1]]
             elif op in STORES:
                 stmts.append(f"{lval(mem(o[1]), STORES[op])} = {ex(o[0])};")
             else:
@@ -1009,12 +1204,18 @@ def tail_sources(f: dict, callees: Callees):
         else:
             n = n_set  # imports: the registers set here (a pass-through one would be missed)
         cargs = [ex(r) for r in AREGS[:n]]
+        nf = max([i + 1 for i, r in enumerate(FARGS) if regs[r] != ("farg", i)] + [0])
+        if target.startswith("func_"):
+            nf = max(nf, callees.freads(target) or 0)
+        fargs = [ex(r) for r in FARGS[:nf]]
     except (ValueError, KeyError):
         return []
     nparams = max(used) + 1 if used else 0
-    params = ", ".join(("char *" if i in ptr else "s32 ") + f"arg{i}" for i in range(nparams)) or "void"
+    params = ", ".join([("char *" if i in ptr else "s32 ") + f"arg{i}" for i in range(nparams)]
+                       + [f"f32 farg{i}" for i in range(max(fused) + 1 if fused else 0)]) or "void"
     ptypes = ["char *" if ((m := re.match(r"^arg(\d+)", a)) and int(m.group(1)) in ptr) or a.startswith("&")
-              else "s32" for a in cargs]
+              else "s32" for a in cargs] + ["f32"] * len(fargs)
+    cargs += fargs  # EABI: float arguments in their own registers, after the integer ones here
     decls = [f"extern void {target}({', '.join(ptypes) or 'void'});"]
     decls += [f"extern {t} {s};" for s, t in sorted(globs.items())]
     out = []
@@ -1040,9 +1241,11 @@ def candidates(f: dict, cfg: Config, callees: Callees):
         if vc := virtual_calls(text):
             yield from draft_sources(f, cfg, vc, every, langs=("cpp",))
         yield from draft_sources(f, cfg, text, every)
-    # then the same with arguments 5-8 ($t0-$t3), drafted only when the above failed
+    # then the same with arguments 5-8 ($t0-$t3) and float arguments ($f12-$f19, given
+    # apart from the integer ones: m2c's o32 drafts read $f12 as `arg0`), drafted only
+    # when the above failed
     if any(op == "jal" for op, _ in f["ins"]) or any(r in ops for _, ops in f["ins"]
-                                                       for r in ("$t0", "$t1", "$t2", "$t3")):
+                                                       for r in (*AREGS[4:], *FARGS)):
         for args in ((f, every), (f, cfg.protos), (f,)):
             text = m2c_draft(*args, eabi=True)
             if text not in seen:
@@ -1114,6 +1317,8 @@ def draft_sources(f: dict, cfg: Config, text: str, ctx: dict[str, str], langs=("
     bodies += [b for b0 in list(bodies) for b in stack_arrays(f, b0) if b not in bodies]
     bodies += [b for b0 in list(bodies) for b in pointer_offsets(b0) if b not in bodies]
     bodies += [b for b0 in bodies[:4] for b in stride_arrays(b0) if b not in bodies]
+    # float to unsigned conversions written out by m2c: each draft replaced (not added)
+    bodies = list(dict.fromkeys((unsigned_casts(b) or [b])[0] for b in bodies))
     bodies += [b for b0 in list(bodies) for b in bool_tests(b0) if b not in bodies]
     bodies += [b for b0 in list(bodies) for b in invert_ifs(b0) if b not in bodies]
     bodies += [b for b0 in list(bodies) for b in narrow_params(f["name"], b0) if b not in bodies]
@@ -1129,6 +1334,8 @@ def draft_sources(f: dict, cfg: Config, text: str, ctx: dict[str, str], langs=("
     pairs = [(decls, b) for b in bodies]
     pairs += [p for b in bodies[:3] + bodies[-6:] if (p := pointer_args(f["name"], decls, b)) and p not in pairs]
     pairs += [p for d, b in pairs[:6] if (p := float_structs(d, b)) and p not in pairs]
+    groups = copy_groups(f["ins"])
+    pairs += [p for d, b in pairs[:6] if (p := stack_copies(d, b, groups)) and p not in pairs]
     kr = KR_DECL.search("\n".join(decls + bodies))
     for lang in langs:
         if lang == "cpp" and kr:  # C++ reads `f()` as taking no arguments
@@ -1178,7 +1385,7 @@ def negate(cond: str) -> str:
     return f"!({cond})"
 
 
-def invert_ifs(body: str, limit: int = 4) -> list[str]:
+def invert_ifs(body: str, limit: int = 4, depth: int = 0) -> list[str]:
     """mwccpsp lays blocks out in source order; m2c puts the long branch first:
 
         if (C) {              ->    if (!(C)) {
@@ -1187,7 +1394,8 @@ def invert_ifs(body: str, limit: int = 4) -> list[str]:
         return Y;                   ...; return X;
 
     for an `if` without `else` whose block ends in `return` or `goto`. One body per
-    such `if` (the first `limit`), and one with all of them inverted."""
+    such `if` (the first `limit`), one with all of them inverted, and one with the
+    nested ones inverted too."""
     lines = body.split("\n")
     sites = []
     for i, l in enumerate(lines):
@@ -1200,26 +1408,44 @@ def invert_ifs(body: str, limit: int = 4) -> list[str]:
         if end is None or end + 1 >= len(lines) or end - i < 2:
             continue
         last, after = lines[end - 1], lines[end + 1]
-        if not re.match(ind + r"    (return\b|goto )", last) or not re.match(ind + r"return\b.*;$", after):
-            continue
         if any(not b.startswith(ind + "    ") and b.strip() for b in lines[i + 1:end]):
             continue
-        sites.append((i, end, ind, m.group(2)))
-    sites = [s for k, s in enumerate(sites) if all(s[0] > t[1] + 1 or s[1] < t[0] for t in sites[:k])]
+        if re.match(ind + r"    (return\b|goto )", last) and re.match(ind + r"return\b.*;$", after):
+            sites.append((i, end, ind, m.group(2), end + 2, False))
+        # a void function: `if (C) { A; return; } B;` up to its end -> `if (!C) { B;
+        # return; } A;` (func_0889A09C)
+        elif not depth and ind == "    " and last == ind + "    return;" and "}" in lines[end + 1:]:
+            # (not again on the result: it would turn back)
+            close = lines.index("}", end + 1)
+            rest = lines[end + 1:close]
+            if rest and all(b.startswith(ind) or not b.strip() for b in rest) \
+                    and not any(re.match(r"\s*(return|goto)\b|^\s*\w+:$", b) for b in rest):
+                sites.append((i, end, ind, m.group(2), close, True))
+    sites = [s for k, s in enumerate(sites) if all(s[0] >= t[4] or s[1] < t[0] for t in sites[:k])]
     sites = sites[:limit]
 
     def apply(chosen):
         out, i = [], 0
-        for s, e, ind, cond in sorted(chosen):
+        for s, e, ind, cond, nxt, void in sorted(chosen):
             out += lines[i:s]
-            out += [f"{ind}if ({negate(cond)}) {{", ind + "    " + lines[e + 1][len(ind):], ind + "}"]
-            out += [b[4:] if b.strip() else b for b in lines[s + 1:e]]
-            i = e + 2
+            if not void:
+                out += [f"{ind}if ({negate(cond)}) {{", ind + "    " + lines[e + 1][len(ind):], ind + "}"]
+                out += [b[4:] if b.strip() else b for b in lines[s + 1:e]]
+            else:
+                out += [f"{ind}if ({negate(cond)}) {{"] + ["    " + b if b.strip() else b for b in lines[e + 1:nxt]]
+                out += [ind + "    return;", ind + "}"] + [b[4:] if b.strip() else b for b in lines[s + 1:e - 1]]
+            i = nxt
         return "\n".join(out + lines[i:])
 
     variants = [apply([s]) for s in sites]
     if len(sites) > 1:
         variants.append(apply(sites))
+    # nested ones show once the outer one is inverted (func_08816060): all of them,
+    # again on the result, a few rounds
+    if sites and depth < 4:
+        deep = invert_ifs(variants[-1], limit, depth + 1)
+        if deep and deep[-1] not in variants:
+            variants.append(deep[-1])
     return variants
 
 
