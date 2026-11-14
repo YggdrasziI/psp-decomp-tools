@@ -11,7 +11,9 @@ or FPU, no jump table, size and call count within limits), C sources are tried:
     given the widths the function loads or stores (typed_derefs), an allocation
     result kept in a temporary (alloc_temps), pointer sums passed uncast to `void *`
     parameters (pointer_args), structure array elements `&((E<K> *) (p + off))[i]`
-    (stride_arrays), `goto`s of merged block tails written out (inline_gotos).
+    (stride_arrays), `goto`s of merged block tails written out (inline_gotos), and,
+    compiled as C++ only, calls through a vtable slot (`jalr $t9`) written as virtual
+    calls (virtual_calls).
     m2c also runs with its `mipsee` target ($t0-$t3 renamed $a4-$a7) so that calls
     keep arguments 5-8 (PSP EABI). An `if` whose block returns, followed by a
     `return`, is also tried inverted (mwccpsp keeps the source order of blocks;
@@ -81,7 +83,7 @@ TYPES = {"s8": "signed char", "u8": "unsigned char", "s16": "short", "u16": "uns
          "s32": "int", "u32": "unsigned int", "f32": "float", "s64": "long long",
          "u64": "unsigned long long", "f64": "double"}
 SIZES = {"s8": 1, "u8": 1, "s16": 2, "u16": 2, "s32": 4, "u32": 4, "f32": 4, "char": 1, "char*": 4}
-# left to hand work: FPU, jumps through registers
+# left to hand work: FPU, jumps through registers (but `jalr $t9`, a virtual call)
 SKIP_OPS = re.compile(r"^(lwc1|swc1|mtc1|mfc1|c\.|bc1|cvt|add\.s|sub\.s|mul\.s|div\.s|mov\.s|neg\.s|"
                       r"abs\.s|sqrt\.s|trunc|floor|ceil|round|jalr|\.word)")
 # a function declared without a prototype: `int f();`
@@ -120,8 +122,8 @@ def eligible(f: dict, cfg: Config, args) -> bool:
         return False
     if not (args.min_size <= f["size"] <= args.max_size) or len(f["calls"]) > args.max_calls:
         return False
-    return not f["vfpu"] and not any(SKIP_OPS.match(op) or (op == "jr" and ops != ["$ra"])
-                                     for op, ops in f["ins"])
+    return not f["vfpu"] and not any((SKIP_OPS.match(op) and not (op == "jalr" and ops[-1:] == ["$t9"]))
+                                     or (op == "jr" and ops != ["$ra"]) for op, ops in f["ins"])
 
 
 C_TYPES = {"void", "char", "int", "short", "float", "double", "signed char", "unsigned char",
@@ -289,6 +291,64 @@ def declaration(l: str) -> str:
     if re.match(r"^\w[\w ]*?\**\s*\w+\(.*\);$", l) and not l.startswith("extern "):
         l = "extern " + l
     return l.replace("extern M2C_UNK", "extern char")
+
+
+VPTR = re.compile(r"^(?:M2C_FIELD\((.*), void \*\*, 0\)|\*(.*))$")
+SLOT = re.compile(r"^(.*?) ?\(\*\*\)\((.*)\)$")
+
+
+def virtual_calls(text: str) -> str | None:
+    """m2c draft with its calls through a vtable slot written as C++ virtual calls, or None.
+
+    mwccpsp loads a virtual call target into $t9 (`lw $t9, 0($a0)`, `lw $t9, off($t9)`,
+    `jalr $t9`); a C call through the same function pointer goes through $v0
+    (func_088DC774). m2c writes `M2C_FIELD(M2C_FIELD(X, void **, 0), T (**)(P...), off)(X,
+    ...)`: it becomes `((V *) (X))->vfunc_<off>(...)`, V a class whose virtual functions
+    fill the slots from vtable offset 8 (Metrowerks: the first 8 bytes are not slots) up to
+    that one. One class per slot signature, declared on one `typedef` line."""
+    classes = {}
+    out, found = text, False
+    for m in reversed(list(re.finditer(r"M2C_FIELD\(", text))):
+        i = m.start()
+        end = matching(out, m.end() - 1)
+        if end < 0 or end >= len(out) or out[end] != "(":
+            continue
+        parts = split_top(out[m.end():end - 1], ",")
+        if len(parts) != 3 or not (slot := SLOT.match(parts[1])) or not (vp := VPTR.match(parts[0])):
+            continue
+        try:
+            off = int(parts[2], 0)
+        except ValueError:
+            continue
+        if off < 8 or off % 4:
+            continue
+        obj = strip_parens(vp.group(1) or vp.group(2))
+        call_end = matching(out, end)
+        if call_end < 0:
+            continue
+        # m2c leaves `this` out when $a0 already holds it: `f()`
+        args = [a for a in split_top(out[end + 1:call_end - 1], ",") if a] or [obj]
+        if strip_parens(args[0]) != obj:
+            continue
+        ret, params = slot.group(1).strip(), [q.strip() for q in split_top(slot.group(2), ",") if q][1:]
+        params = ["s32" if q == "M2C_UNK" else q.replace("M2C_UNK *", "char *") for q in params]
+        if any("M2C_" in q or "(" in q for q in params) or "(" in ret:
+            continue
+        if ret == "M2C_UNK":  # unknown: nothing if the call is a statement, else an int
+            line_start = out.rfind("\n", 0, i) + 1
+            ret = "void" if not out[line_start:i].strip() and out[call_end:].startswith(";") else "s32"
+        slots = "".join(f" virtual void vfunc_{k:02X}();" for k in range(8, off, 4))
+        decl = f"{ret}{'' if ret.endswith('*') else ' '}vfunc_{off:02X}({', '.join(params)})"
+        key = f"{off:X}:{decl}"
+        if key not in classes:
+            classes[key] = (f"V{off:02X}_{len(classes)}", slots + f" virtual {decl};")
+        cls = classes[key][0]
+        out = out[:i] + f"(({cls} *) ({obj}))->vfunc_{off:02X}({', '.join(args[1:])})" + out[call_end:]
+        found = True
+    if not found:
+        return None
+    lines = [f"typedef struct {n} {{{body} }} {n};" for n, body in classes.values()]
+    return "\n".join(lines) + "\n" + out
 
 
 def convert(name: str, text: str, array):
@@ -907,6 +967,8 @@ def candidates(f: dict, cfg: Config, callees: Callees):
     seen = set()
     for text in dict.fromkeys([m2c_draft(f, every), m2c_draft(f, cfg.protos), m2c_draft(f)]):
         seen.add(text)
+        if vc := virtual_calls(text):
+            yield from draft_sources(f, cfg, vc, every, langs=("cpp",))
         yield from draft_sources(f, cfg, text, every)
     # then the same with arguments 5-8 ($t0-$t3), drafted only when the above failed
     if any(op == "jal" for op, _ in f["ins"]) or any(r in ops for _, ops in f["ins"]
@@ -915,6 +977,8 @@ def candidates(f: dict, cfg: Config, callees: Callees):
             text = m2c_draft(*args, eabi=True)
             if text not in seen:
                 seen.add(text)
+                if vc := virtual_calls(text):
+                    yield from draft_sources(f, cfg, vc, every, langs=("cpp",))
                 yield from draft_sources(f, cfg, text, every)
 
 
@@ -936,7 +1000,7 @@ def n_params(proto: str) -> int:
     return 0 if p in ("", "void") else p.count(",") + 1
 
 
-def draft_sources(f: dict, cfg: Config, text: str, ctx: dict[str, str]):
+def draft_sources(f: dict, cfg: Config, text: str, ctx: dict[str, str], langs=("c", "cpp")):
     plain, arr = convert(f["name"], text, False), convert(f["name"], text, True)
     if plain is None:
         return
@@ -995,7 +1059,7 @@ def draft_sources(f: dict, cfg: Config, text: str, ctx: dict[str, str]):
     pairs = [(decls, b) for b in bodies]
     pairs += [p for b in bodies[:3] + bodies[-6:] if (p := pointer_args(f["name"], decls, b)) and p not in pairs]
     kr = KR_DECL.search("\n".join(decls + bodies))
-    for lang in ("c", "cpp"):
+    for lang in langs:
         if lang == "cpp" and kr:  # C++ reads `f()` as taking no arguments
             break
         for d, b in pairs:
