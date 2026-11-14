@@ -326,11 +326,14 @@ def virtual_calls(text: str) -> str | None:
         call_end = matching(out, end)
         if call_end < 0:
             continue
-        # m2c leaves `this` out when $a0 already holds it: `f()`
-        args = [a for a in split_top(out[end + 1:call_end - 1], ",") if a] or [obj]
-        if strip_parens(args[0]) != obj:
+        # m2c leaves `this` out when $a0 already holds it, then gives the other
+        # arguments only ($a1...): `f()`, `f(6, x, 0)`
+        args = [a for a in split_top(out[end + 1:call_end - 1], ",") if a]
+        ret, params = slot.group(1).strip(), [q.strip() for q in split_top(slot.group(2), ",") if q]
+        if args and strip_parens(args[0]) == obj:
+            args, params = args[1:], params[1:]
+        elif len(params) != len(args):
             continue
-        ret, params = slot.group(1).strip(), [q.strip() for q in split_top(slot.group(2), ",") if q][1:]
         params = ["s32" if q == "M2C_UNK" else q.replace("M2C_UNK *", "char *") for q in params]
         if any("M2C_" in q or "(" in q for q in params) or "(" in ret:
             continue
@@ -343,7 +346,7 @@ def virtual_calls(text: str) -> str | None:
         if key not in classes:
             classes[key] = (f"V{off:02X}_{len(classes)}", slots + f" virtual {decl};")
         cls = classes[key][0]
-        out = out[:i] + f"(({cls} *) ({obj}))->vfunc_{off:02X}({', '.join(args[1:])})" + out[call_end:]
+        out = out[:i] + f"(({cls} *) ({obj}))->vfunc_{off:02X}({', '.join(args)})" + out[call_end:]
         found = True
     if not found:
         return None
@@ -1294,7 +1297,9 @@ def bool_tests(body: str, limit: int = 3) -> list[str]:
     """The original turns a flag test into a C++ `bool` (`andi`, `sltu $v0, $zero, $v0`)
     and compares that with 0 or 1 (an inlined `bool` getter): `!(A & K)`,
     `(A & K) == 0` and `(A & K) == 1` become `(bool) (A & K) == 0 / 1` (func_0881C884,
-    func_08828884; C++ only). One body per site (the first `limit`), and one with all."""
+    func_08828884; C++ only); a plain `if (A & K)` becomes `if ((bool) (A & K) != 0)`
+    (`sltu` then `beqz`, func_08864634). One body per site (the first `limit`), and one
+    with all."""
     sites = []
     for m in re.finditer(r"!\(|\(", body):
         start = m.end() - 1
@@ -1311,6 +1316,8 @@ def bool_tests(body: str, limit: int = 3) -> list[str]:
             sites.append((m.start(), end, f"((bool) ({inner}) == 0)"))
         elif (t := re.match(r" (==) ([01])\b", body[end:])):
             sites.append((start, end + t.end(), f"(bool) ({inner}) == {t.group(2)}"))
+        elif body[:m.start()].endswith("if ") and body[end:].startswith(" {"):
+            sites.append((start, end, f"((bool) ({inner}) != 0)"))
     kept = []
     for s in sites:
         if all(s[0] >= t[1] or s[1] <= t[0] for t in kept):
