@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Decompile small functions in batches and turn the matching ones into units.
 
-For every assembly function of the module in the configured address ranges (no VFPU
-or FPU, no jump table, size and call count within limits), C sources are tried:
+For every assembly function of the module in the configured address ranges (no VFPU,
+no jump table, size and call count within limits), C sources are tried:
 
   - the m2c draft (`--valid-syntax`), field accesses written `*(type *)(p + off)`,
     with variants: indexed accesses as arrays, unsigned stores, `int` arguments
@@ -83,9 +83,9 @@ TYPES = {"s8": "signed char", "u8": "unsigned char", "s16": "short", "u16": "uns
          "s32": "int", "u32": "unsigned int", "f32": "float", "s64": "long long",
          "u64": "unsigned long long", "f64": "double"}
 SIZES = {"s8": 1, "u8": 1, "s16": 2, "u16": 2, "s32": 4, "u32": 4, "f32": 4, "char": 1, "char*": 4}
-# left to hand work: FPU, jumps through registers (but `jalr $t9`, a virtual call)
-SKIP_OPS = re.compile(r"^(lwc1|swc1|mtc1|mfc1|c\.|bc1|cvt|add\.s|sub\.s|mul\.s|div\.s|mov\.s|neg\.s|"
-                      r"abs\.s|sqrt\.s|trunc|floor|ceil|round|jalr|\.word)")
+# left to hand work: VFPU (`.word`), jumps through registers (but `jalr $t9`, a virtual
+# call); FPU code is tried (float arguments and copies)
+SKIP_OPS = re.compile(r"^(jalr|\.word)")
 # a function declared without a prototype: `int f();`
 KR_DECL = re.compile(r"^(?:extern )?\w[\w ]*?\**\s*(\w+)\(\);$", re.M)
 # argument registers, EABI: $a0-$a3 then $t0-$t3
@@ -1787,6 +1787,7 @@ def tidy(src: str) -> str:
             break
         src = src[:i] + "(" + src[i + len("(char *)("):j] + ")" + src[j + 1:]
     src = re.sub(r"\((\w+) \+ 0\)", r"\1", src)
+    src = src.replace("(f32) *(f32 *)", "*(f32 *)")  # m2c's float copies
     return re.sub(r"\{\n\n\}", "{\n}", src)
 
 
