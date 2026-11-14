@@ -605,13 +605,90 @@ def unsigned_casts(body: str) -> list[str]:
     return [b] if b != body else []
 
 
+def byte_structs(name: str, body: str) -> list[str]:
+    """A 4-byte structure passed by value in a register (`struct {u8 r, g, b, a}`):
+    mwccpsp stores the register to its home slot and reads the bytes back with `lbu`,
+    so m2c declares the slot as an `s32 spXX = argN;` read as `(u8) spXX` and the other
+    bytes as undeclared `unkspYY` (func_08861D7C). The parameter becomes a `B4`
+    (`typedef struct { u8 b0, b1, b2, b3; } B4;`) read field by field; a slot
+    assigned from anything else becomes a `B4` local written as a word."""
+    out = []
+    for m in re.finditer(r"^    (?:s32|u32) (sp([0-9A-F]+));$", body, re.M):
+        sp, base = m.group(1), int(m.group(2), 16)
+        unk = {int(x, 16) for x in re.findall(r"\bunksp([0-9A-F]+)\b", body)}
+        if not (unk & {base + 1, base + 2, base + 3}):
+            continue
+        a = re.search(r"^    " + sp + r" = (.+);$", body, re.M)
+        if not a:
+            continue
+        b = body
+        for k in (1, 2, 3):
+            b = re.sub(r"(?:\((?:s32|u32|u8)\) )*\bunksp" + f"{base + k:X}" + r"\b", f"{sp}.b{k}", b)
+        b = re.sub(r"(?:\((?:s32|u32)\) )*\(u8\) " + sp + r"\b", f"{sp}.b0", b)
+        if "unksp" in b:
+            continue
+        param = re.fullmatch(r"arg\d+", a.group(1))
+        head = re.search(r"^.*\b" + name + r"\(([^)]*)\) \{$", b, re.M)
+        if param and head and re.search(r"\b\w+ \**" + a.group(1) + r"\b", head.group(1)):
+            p = a.group(1)
+            b = b.replace(head.group(0), re.sub(r"\b\w+ \**" + p + r"\b", "B4 " + p, head.group(0)), 1)
+            b = b.replace(m.group(0) + "\n", "", 1).replace(a.group(0) + "\n", "", 1)
+            b = re.sub(r"\b" + sp + r"\.", p + ".", b)
+            if not re.search(r"\b" + sp + r"\b", b):
+                out.append(b)
+            continue
+        b = b.replace(m.group(0), f"    B4 {sp};", 1)
+        b = b.replace(a.group(0), f"    *(u32 *) &{sp} = {a.group(1)};", 1)
+        if not re.search(r"\b" + sp + r"\b(?!\.b\d)", b.replace(f"&{sp} =", "")):
+            out.append(b)
+    return out
+
+
+def pointer_steps(decls: list[str], body: str) -> str | None:
+    """m2c types a global pointer `s32 *D_X` but writes its step in bytes
+    (`D_X += 4;`, an `addiu 4`): the step in elements (`D_X += 1;`, func_08861D7C)."""
+    b = body
+    for m in re.finditer(r"^extern (\w+) \*(D_\w+);$", "\n".join(decls), re.M):
+        k = SIZES.get(m.group(1))
+        if k and k > 1:
+            b = re.sub(r"\b(" + m.group(2) + r") ([+-])= (\d+);",
+                       lambda s: f"{s.group(1)} {s.group(2)}= {int(s.group(3)) // k};"
+                       if int(s.group(3)) % k == 0 else s.group(0), b)
+    return b if b != body else None
+
+
+def byte_pointers(decls: list[str], body: str):
+    """The same m2c habit on whole functions (func_0884C7C0): `s32 *` globals and
+    locals stepped and offset in bytes (`D_X = temp + 4; *(s32 *)(temp + 4) = ...`).
+    They become `char *`, their plain dereferences `*(s32 *)p`. -> (decls, body) or
+    None."""
+    ptr = re.compile(r"^(extern |    )(s32|u32|s16|u16) \*(\w+);$", re.M)
+    names = {m.group(3): m.group(2) for m in ptr.finditer("\n".join(decls) + "\n" + body)}
+    names = {n: t for n, t in names.items() if not re.search(r"\b" + n + r"\s*\[", body)}
+    if not names:
+        return None
+    retype = lambda s: ptr.sub(lambda m: f"{m.group(1)}char *{m.group(3)};" if m.group(3) in names  # noqa: E731
+                               else m.group(0), s)
+    d = [retype(x) for x in decls]
+    lines = []
+    for line in retype(body).split("\n"):
+        if not ptr.match(line) and not line.startswith("    char *"):
+            line = re.sub(r"(?<![\w)\]])\*(" + "|".join(names) + r")\b(?!\s*\()",
+                          lambda m: f"*({names[m.group(1)]} *){m.group(1)}", line)
+        lines.append(line)
+    b = "\n".join(lines)
+    return (d, b) if (d, b) != (decls, body) else None
+
+
 def typedefs(src: str) -> list[str]:
     copies = sorted(set(re.findall(r"\bC(\d(?:_\d)+)\b", src)))  # see stack_copies
     floats = sorted({int(x) for x in re.findall(r"\bF(\d)\b", src)}
                     | {int(g) for c in copies for g in c.split("_")})
     tds = [f"typedef {v} {k};" for k, v in TYPES.items()
-           if re.search(r"\b" + k + r"\b", src) or (k == "f32" and floats)]  # F<n> uses f32
+           if re.search(r"\b" + k + r"\b", src) or (k == "f32" and floats)  # F<n> uses f32
+           or (k == "u8" and re.search(r"\bB4\b", src))]
     strides = sorted({int(x) for x in re.findall(r"\bE(\d+)\b", src)})
+    tds += ["typedef struct { u8 b0, b1, b2, b3; } B4;"] if re.search(r"\bB4\b", src) else []
     return (tds + [f"typedef struct {{ char b[{k}]; }} E{k};" for k in strides]
             + [f"typedef struct {{ f32 {', '.join(FIELDS[:k])}; }} F{k};" for k in floats]
             + ["typedef struct { " + " ".join(f"F{g} p{j};" for j, g in enumerate(c.split("_")))
@@ -1313,6 +1390,8 @@ def draft_sources(f: dict, cfg: Config, text: str, ctx: dict[str, str], langs=("
     m = re.search(r"^.*\b" + f["name"] + r"\(([^)]*)\) \{$", bodies[0], re.M)
     if m and "s32 arg" in m.group(1):
         bodies.append(bodies[0].replace(m.group(0), re.sub(r"s32 (arg\d)", r"char *\1", m.group(0))))
+    bodies += [b for b0 in list(bodies) if (b := pointer_steps(decls, b0)) and b not in bodies]
+    bodies += [b for b0 in list(bodies) for b in byte_structs(f["name"], b0) if b not in bodies]
     bodies += [b for b0 in list(bodies) for b in typed_derefs(f, decls, b0)]
     bodies += [b for b0 in list(bodies) for b in stack_arrays(f, b0) if b not in bodies]
     bodies += [b for b0 in list(bodies) for b in pointer_offsets(b0) if b not in bodies]
@@ -1333,6 +1412,7 @@ def draft_sources(f: dict, cfg: Config, text: str, ctx: dict[str, str], langs=("
                 bodies.append(b)
     pairs = [(decls, b) for b in bodies]
     pairs += [p for b in bodies[:3] + bodies[-6:] if (p := pointer_args(f["name"], decls, b)) and p not in pairs]
+    pairs += [p for d, b in pairs[:8] if (p := byte_pointers(d, b)) and p not in pairs]
     pairs += [p for d, b in pairs[:6] if (p := float_structs(d, b)) and p not in pairs]
     groups = copy_groups(f["ins"])
     pairs += [p for d, b in pairs[:6] if (p := stack_copies(d, b, groups)) and p not in pairs]
