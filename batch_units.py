@@ -1408,6 +1408,7 @@ def draft_sources(f: dict, cfg: Config, text: str, ctx: dict[str, str], langs=("
     bodies += [b for b0 in list(bodies) for b in typed_derefs(f, decls, b0)]
     bodies += [b for b0 in list(bodies) for b in stack_arrays(f, b0) if b not in bodies]
     bodies += [b for b0 in list(bodies) for b in pointer_offsets(b0) if b not in bodies]
+    bodies += [b for b0 in bodies[:4] for b in byte_offsets(f["name"], b0) if b not in bodies]
     bodies += [b for b0 in bodies[:4] for b in stride_arrays(b0) if b not in bodies]
     # float to unsigned conversions written out by m2c: each draft replaced (not added)
     bodies = list(dict.fromkeys((unsigned_casts(b) or [b])[0] for b in bodies))
@@ -1814,6 +1815,21 @@ def pointer_offsets(body: str) -> list[str]:
         new = f"(char *){base} + {m.group(2)}"
         out = out[:start] + new + out[end:]
         i = start + len(new)
+    return [out] if out != body else []
+
+
+def byte_offsets(name: str, body: str) -> list[str]:
+    """m2c types a `this` it saw read at offset 0 as `char **argN`, then writes the
+    address of a member at byte offset K as `(argN + K)`, which C scales by 4
+    (func_088B9884, func_088CC604: `addiu $v0, $s1, 0x1C` became `0x70`). Each such
+    sum is written `(char *) argN + K` (func_08861694: `f(arg3, arg0 + 0x10)`). One
+    body with every site."""
+    m = re.search(r"^.*\b" + name + r"\(([^)]*)\) \{$", body, re.M)
+    if not m:
+        return []
+    out = body
+    for a in re.findall(r"\b\w+ \*\*(arg\d)\b", m.group(1)):
+        out = re.sub(r"(?<![\w)] )\b%s \+ (0x[0-9A-Fa-f]+|\d+)\b" % a, r"(char *) %s + \1" % a, out)
     return [out] if out != body else []
 
 
