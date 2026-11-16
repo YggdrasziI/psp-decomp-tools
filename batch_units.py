@@ -21,7 +21,9 @@ no jump table, size and call count within limits), C sources are tried:
     m2c also runs with its `mipsee` target ($t0-$t3 renamed $a4-$a7) so that calls
     keep arguments 5-8 and float arguments $f12-$f19 are their own (PSP EABI). An `if` whose block returns, followed by a
     `return`, is also tried inverted (mwccpsp keeps the source order of blocks;
-    comparisons are negated by their operator, `!(a < b)` compiles differently).
+    comparisons are negated by their operator, `!(a < b)` compiles differently);
+    `if` / `else` blocks are tried swapped with the condition negated (swap_else), and
+    `return E != 0;` written `if (!(E)) return 0; return 1;` (bool_returns).
     m2c is given the prototypes of the functions already declared in src/ as
     context (pointers as `void *`, see known_prototypes) and, for functions still
     in assembly, as many `s32` arguments as they read (guess_prototypes); then it
@@ -1399,7 +1401,9 @@ def draft_sources(f: dict, cfg: Config, text: str, ctx: dict[str, str], langs=("
     # float to unsigned conversions written out by m2c: each draft replaced (not added)
     bodies = list(dict.fromkeys((unsigned_casts(b) or [b])[0] for b in bodies))
     bodies += [b for b0 in list(bodies) for b in bool_tests(b0) if b not in bodies]
+    bodies += [b for b0 in bodies[:4] for b in bool_returns(b0) if b not in bodies]
     bodies += [b for b0 in list(bodies) for b in invert_ifs(b0) if b not in bodies]
+    bodies += [b for b0 in bodies[:6] for b in swap_else(b0) if b not in bodies]
     bodies += [b for b0 in list(bodies) for b in narrow_params(f["name"], b0) if b not in bodies]
     # signedness, on the first bodies only (each adds a few per site)
     bodies += [b for b0 in bodies[:4] for b in widen_narrow(f["name"], b0) if b not in bodies]
@@ -1521,12 +1525,82 @@ def invert_ifs(body: str, limit: int = 4, depth: int = 0) -> list[str]:
     if len(sites) > 1:
         variants.append(apply(sites))
     # nested ones show once the outer one is inverted (func_08816060): all of them,
-    # again on the result, a few rounds
+    # again on the result, a few rounds; the first deep variant too, as the last one of
+    # the next round may turn an inverted `if` back (func_08813158)
     if sites and depth < 4:
         deep = invert_ifs(variants[-1], limit, depth + 1)
-        if deep and deep[-1] not in variants:
-            variants.append(deep[-1])
+        variants += [d for d in dict.fromkeys(deep[:1] + deep[-1:]) if d not in variants and d != body]
     return variants
+
+
+def swap_else(body: str, limit: int = 4) -> list[str]:
+    """mwccpsp lays out the two blocks of an `if` / `else` in source order (the `else`
+    block in the branch-likely delay slot, func_0881CA34); m2c may write them the other
+    way round:
+
+        if (C) {        ->    if (!(C)) {
+            A;                    B;
+        } else {              } else {
+            B;                    A;
+        }                     }
+
+    for an `if` / `else` whose `else` is not an `else if` (and that is not itself an
+    `else if`). One body per such `if` (the first `limit`), and one with all of them."""
+    lines = body.split("\n")
+    sites = []
+    for i, l in enumerate(lines):
+        m = re.match(r"^(\s*)if \((.*)\) \{$", l)
+        if not m:
+            continue
+        ind = m.group(1)
+        mid = next((j for j in range(i + 1, len(lines)) if lines[j].startswith(ind + "}")
+                    and not lines[j].startswith(ind + "    ")), None)
+        if mid is None or lines[mid] != ind + "} else {":
+            continue
+        end = next((j for j in range(mid + 1, len(lines)) if lines[j].startswith(ind + "}")
+                    and not lines[j].startswith(ind + "    ")), None)
+        if end is None or lines[end] != ind + "}":
+            continue
+        sites.append((i, mid, end, ind, m.group(2)))
+    sites = [s for k, s in enumerate(sites) if all(s[0] > t[2] or s[2] < t[0] for t in sites[:k])]
+    sites = sites[:limit]
+
+    def apply(chosen):
+        out, i = [], 0
+        for s, mid, e, ind, cond in sorted(chosen):
+            out += lines[i:s] + [f"{ind}if ({negate(cond)}) {{"] + lines[mid + 1:e] + [ind + "} else {"]
+            out += lines[s + 1:mid] + [ind + "}"]
+            i = e + 1
+        return "\n".join(out + lines[i:])
+
+    variants = [apply([s]) for s in sites]
+    if len(sites) > 1:
+        variants.append(apply(sites))
+    return variants
+
+
+def bool_returns(body: str, limit: int = 2) -> list[str]:
+    """m2c folds `if (!(E)) { return 0; } return 1;` into `return E != 0;`, which
+    mwccpsp lays out another way (`sltu` after a shared tail, func_08854D88). For the
+    first `limit` such returns: `return E != 0;` -> `if (!(E)) { return 0; } return 1;`,
+    `if (E == 0) ...` and `if (E) { return 1; } return 0;` (`== 0` the other way
+    round). One body per site and form."""
+    lines = body.split("\n")
+    sites = [(i, m) for i, l in enumerate(lines)
+             if (m := re.match(r"^(\s*)return (.*) (!=|==) 0;$", l))
+             and not re.search(r"[=!<>]=|&&|\|\||\?|(?<![-<>])[<>](?![<>=])", m.group(2))]
+    out = []
+    for i, m in sites[:limit]:
+        ind, e, op = m.groups()
+        p = e if re.fullmatch(r"\w+|\(.*\)", e) and (not e.startswith("(") or matching(e, 0) == len(e)) \
+            else f"({e})"
+        zero = [f"!{p}", f"{e} == 0"]
+        forms = ([(c, "0", "1") for c in zero] + [(e, "1", "0")] if op == "!=" else
+                 [(e, "0", "1"), (f"{e} != 0", "0", "1")] + [(c, "1", "0") for c in zero])
+        for cond, a, b in forms:
+            new = [f"{ind}if ({cond}) {{", f"{ind}    return {a};", f"{ind}}}", f"{ind}return {b};"]
+            out.append("\n".join(lines[:i] + new + lines[i + 1:]))
+    return out
 
 
 def narrow_params(name: str, body: str) -> list[str]:
