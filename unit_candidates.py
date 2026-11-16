@@ -27,15 +27,15 @@ INSN = re.compile(r"^\s*/\* [0-9A-F]+ ([0-9A-F]{8}) [0-9A-F]{8} \*/\s+([a-z0-9.]
 
 def read_functions(paths: list[Path]) -> list[dict]:
     """Functions of splat assembly files: name, addr, size, calls (jal targets), vfpu,
-    lines (from glabel to endlabel), ins ([(mnemonic, [operands])]) and label (has a
-    local label, i.e. branches inside)."""
+    lines (from glabel to endlabel), ins ([(mnemonic, [operands])]), label (has a
+    local label, i.e. branches inside) and piece (stem of the assembly file)."""
     funcs = []
     for path in paths:
         cur = None
         for line in path.read_text(encoding="utf-8").splitlines():
             if m := GLABEL.match(line):
                 cur = {"name": m.group(1), "addr": None, "size": 0, "calls": [], "vfpu": False,
-                       "lines": [line], "ins": [], "label": False}
+                       "lines": [line], "ins": [], "label": False, "piece": path.stem}
                 funcs.append(cur)
             elif cur is None:
                 continue

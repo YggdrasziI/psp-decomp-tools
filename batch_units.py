@@ -70,6 +70,7 @@ in C, the built ELF of the module (build/<version>/<module>.elf).
 """
 
 import argparse
+import functools
 import itertools
 import os
 import re
@@ -125,10 +126,20 @@ class Config:
         return struct.unpack_from("<I", self.data, self.off + addr)[0]
 
 
+@functools.cache
+def nonmatching_pieces() -> frozenset[str]:
+    """Assembly pieces `text_<addr>` of the NonMatching units: `src/unit_<addr>.c` (or
+    `.cpp`) exists while the piece is still assembly (tools/configure.py)."""
+    return frozenset(f"text_{p.stem[len('unit_'):]}" for ext in ("c", "cpp")
+                     for p in (project.ROOT / "src").rglob(f"unit_*.{ext}"))
+
+
 def eligible(f: dict, cfg: Config, args) -> bool:
     if not f["name"].startswith("func_") or not any(lo <= f["addr"] < hi for lo, hi in cfg.ranges):
         return False
     if not (args.min_size <= f["size"] <= args.max_size) or len(f["calls"]) > args.max_calls:
+        return False
+    if f["piece"] in nonmatching_pieces():  # a NonMatching unit is worked on by hand
         return False
     return not f["vfpu"] and not any((SKIP_OPS.match(op) and not (op == "jalr" and ops[-1:] == ["$t9"]))
                                      or (op == "jr" and ops != ["$ra"]) for op, ops in f["ins"])
