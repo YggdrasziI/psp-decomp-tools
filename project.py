@@ -22,6 +22,7 @@ decomp.toml:
     name = "mwccpsp_3.0.1_219"            # tools/compilers/<name>/ (decomp.me archive)
     exe = "mwccpsp.exe"
     flags = "-O4"                         # code generation flags, no include paths
+    rename_sections = [".rodata=.data"]   # optional: section renames in each object
 
     [batch]                               # optional: batch_units.py
     splits = "notes/SPLITS.md"            # table of units to add rows to

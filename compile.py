@@ -10,7 +10,12 @@ The static initialization of a file (`__sti__<file>_cpp`) is a local symbol, but
 `.cplinit` table, still assembly, refers to it by name (config/<version>/
 symbol_addrs.txt): it is made global.
 
-usage: compile.py <objcopy> <out.o> <compiler command...>
+A game whose link merged the read-only data into `.data` (no `.rodata` in the
+image) needs the same in each unit before its data can sit at its own place in the
+linker script: `--rename-section .rodata=.data` renames every section of that name
+(switch jump tables, constants) and makes it writable data.
+
+usage: compile.py [--rename-section <old>=<new>]... <objcopy> <out.o> <compiler command...>
 (the compiler command must write <out.o>)
 """
 
@@ -39,9 +44,16 @@ def empty_alloc_sections(path: Path) -> list[str]:
 def main() -> None:
     # Metrowerks drivers warn and stop without it; includes come from -I flags
     os.environ.setdefault("MWCIncludes", ".")
-    if len(sys.argv) < 4:
+    argv = sys.argv[1:]
+    renames = []
+    while len(argv) >= 2 and argv[0] == "--rename-section":
+        if "=" not in argv[1]:
+            sys.exit(f"compile.py: --rename-section {argv[1]}: expected <old>=<new>")
+        renames.append(argv[1])
+        argv = argv[2:]
+    if len(argv) < 3:
         sys.exit(__doc__)
-    objcopy, out, command = sys.argv[1], Path(sys.argv[2]), sys.argv[3:]
+    objcopy, out, command = argv[0], Path(argv[1]), argv[2:]
     out.parent.mkdir(parents=True, exist_ok=True)
     # Windows CreateProcess does not find a relative path written with '/'
     command[0] = str(Path(command[0]).resolve())
@@ -51,6 +63,9 @@ def main() -> None:
     args = [str(Path(objcopy).resolve()), "--wildcard", "--globalize-symbol=__sti__*"]
     for name in empty_alloc_sections(out):
         args += ["--remove-section", name]
+    for rename in renames:
+        # an empty section of the old name is removed above, not renamed
+        args += ["--rename-section", f"{rename},alloc,load,data,contents"]
     subprocess.run(args + [str(out)], check=True)
 
 
