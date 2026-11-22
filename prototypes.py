@@ -11,7 +11,8 @@ imports (`sce*`). Reported:
     reads (argument registers $a0-$a3, $t0-$t3 read before written anywhere in the
     function, see batch_units.Callees.reads): the missing ones are passed without
     being written in the C. That count is a lower bound (unused arguments are not
-    seen); variadic functions are skipped;
+    seen); variadic functions are skipped; a struct returned by value counts one more
+    (its result address is passed first, in $a0);
   - a declaration without a prototype (`T f();`): the call shows no arguments.
 
 The functions already in C are read from the built ELF: run it after a build that
@@ -38,13 +39,34 @@ PROTO = re.compile(r"^(?:extern\s+)?((?:const\s+|unsigned\s+|signed\s+)?\w+[\s\*
 FLOAT = re.compile(r"^(?:const\s+)?(float|double|f32|f64)\b(?![\s\w]*\*)")
 
 
+TYPEDEF_AGGREGATE = re.compile(r"\btypedef\s+(?:struct|union)\b[^{;]*\{")
+
+
+def aggregate_names(text: str) -> set[str]:
+    """Names of the `typedef struct { ... } Name;` (and union) types of a source."""
+    names = set()
+    for m in TYPEDEF_AGGREGATE.finditer(text):
+        depth, i = 1, m.end()
+        while i < len(text) and depth:
+            depth += {"{": 1, "}": -1}.get(text[i], 0)
+            i += 1
+        name = re.match(r"\s*(\w+)\s*;", text[i:])
+        if name:
+            names.add(name.group(1))
+    return names
+
+
 class Proto:
-    def __init__(self, ret: str, params: str, path: Path, line: int, definition: bool):
+    def __init__(self, ret: str, params: str, path: Path, line: int, definition: bool,
+                 aggregates: set[str] = frozenset()):
         self.ret = " ".join(ret.split()).replace(" *", "*")
         p = params.strip()
         self.known = p != ""  # `f()` in C: no prototype
         self.params = [] if p in ("", "void") else [x.strip() for x in p.split(",")]
         self.path, self.line, self.definition = path, line, definition
+        # a struct returned by value: its address comes first, in $a0
+        self.hidden = "*" not in self.ret and (self.ret in aggregates
+                                               or re.match(r"(struct|union)\b", self.ret) is not None)
 
     @property
     def count(self) -> int:
@@ -52,8 +74,9 @@ class Proto:
 
     @property
     def int_count(self) -> int:
-        """Arguments passed in integer registers (floats go to $f12+)."""
-        return sum(1 for x in self.params if not FLOAT.match(x) and x != "...")
+        """Arguments passed in integer registers (floats go to $f12+), with the hidden
+        result address of a struct returned by value."""
+        return self.hidden + sum(1 for x in self.params if not FLOAT.match(x) and x != "...")
 
     def where(self) -> str:
         return f"{self.path.relative_to(project.ROOT).as_posix()}:{self.line}"
@@ -66,11 +89,13 @@ def read_protos(src_dir: Path) -> dict[str, list[Proto]]:
     protos = collections.defaultdict(list)
     for path in sorted(src_dir.glob("*.c*")):
         text = path.read_text(encoding="utf-8")
+        aggregates = aggregate_names(text)
         for m in PROTO.finditer(text):
             if m.group(1).strip() in ("return", "else"):
                 continue
             line = text.count("\n", 0, m.start()) + 1
-            protos[m.group(2)].append(Proto(m.group(1), m.group(3), path, line, m.group(4) == "{"))
+            protos[m.group(2)].append(Proto(m.group(1), m.group(3), path, line, m.group(4) == "{",
+                                            aggregates))
     return protos
 
 
