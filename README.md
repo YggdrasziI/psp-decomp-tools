@@ -11,7 +11,10 @@ psp-decomp-tools
 Shared tooling for matching decompilations of PSP games built with
 [splat](https://github.com/ethteck/splat), GNU binutils and
 [objdiff](https://github.com/encounter/objdiff). It is meant to be used as a git
-submodule at `tools/psp/` of a project.
+submodule at `tools/psp/` of a project, next to
+[decomp-tools](https://github.com/YggdrasziI/decomp-tools) at `tools/common/`, which
+holds what does not depend on the platform (function comparison, report gate,
+progress card, trace guard, checksum, ninja writer).
 
 Projects using it:
 
@@ -22,7 +25,8 @@ Setup
 
 ```sh
 git submodule add https://github.com/YggdrasziI/psp-decomp-tools.git tools/psp
-python tools/psp/check_traces.py --install-hooks
+git submodule add https://github.com/YggdrasziI/decomp-tools.git tools/common
+python tools/common/check_traces.py --install-hooks
 ```
 
 The tools find the project from the current directory upwards through a
@@ -52,23 +56,18 @@ Tools
 | `compile.py` | Run a compiler, then drop empty allocated sections |
 | `lmgr_patch.py` | Let Metrowerks compilers run natively on Windows (FLEXlm checkout stubbed, as wibo does); applied by `download_tool.py` |
 | `compiler_probe.py` | Compile a probe file and compare its `func_XXXXXXXX` functions with the original |
-| `asm_compare.py` | One function side by side, from `objdiff-cli diff` |
-| `report_diff.py` | Regression gate between two objdiff reports |
-| `progress_badges.py` | README badges, progress card and history from the objdiff report |
 | `unit_candidates.py`, `tu_ends.py` | Find the next functions to decompile and translation-unit ends |
 | `batch_units.py` | Decompile small functions in batches (m2c drafts, tail-call forwarders), keep the matching ones as units (`[batch]` in `decomp.toml`) |
 | `prototypes.py` | Check that the C sources give each function one argument count, no fewer than it reads, and no unprototyped declarations |
 | `ghidra_sync.py`, `ghidra/SyncSymbols.java` | Push the splat symbols to a Ghidra project (ghidra-allegrex) headless |
-| `check_traces.py` | Pre-commit / CI guard against local paths, attribution trailers and private files |
-| `download_tool.py`, `get_platform.py`, `ninja_syntax.py`, `sha1.py` | Build helpers |
+| `download_tool.py`, `get_platform.py` | Build helpers |
 | `nids.txt` | NID → function name, extracted from PPSSPP's HLE tables (`prx_symbols.py --ppsspp`) |
 | `probes/` | Compiler probe sources |
 
 Provenance
 ==========
 
-- `ninja_syntax.py` comes from [ninja](https://github.com/ninja-build/ninja) (Apache-2.0,
-  header kept); `get_platform.py` and `download_tool.py` come from
+- `get_platform.py` and `download_tool.py` come from
   [Yotona/twewy](https://github.com/Yotona/twewy) (CC0-1.0), modified.
 - `nids.txt` holds only the NID → name facts from PPSSPP's `Core/HLE/*.cpp`
   (GPL-2.0-or-later), no code.
