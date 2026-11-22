@@ -9,6 +9,8 @@ decomp.toml:
     title = "Game title"                  # progress card
     versions = ["ULES01213", ...]         # first one is the default version
     binutils_prefix = "mips-ps2-decompals-"
+    ghidra_project = "game"               # optional: Ghidra project name before _<version>
+                                          # (ghidra_sync.py; default: the root folder's name)
 
     [modules.boot]                        # first module is the default module
     file = "BOOT.BIN"                     # in orig/<version>/
@@ -56,6 +58,7 @@ TITLE: str = CONFIG.get("title", ROOT.name)
 VERSIONS: list[str] = CONFIG["versions"]
 DEFAULT_VERSION: str = VERSIONS[0]
 BINUTILS_PREFIX: str = CONFIG.get("binutils_prefix", "mips-ps2-decompals-")
+GHIDRA_PROJECT: str = CONFIG.get("ghidra_project", ROOT.name.replace("-", "_"))
 
 
 @dataclass

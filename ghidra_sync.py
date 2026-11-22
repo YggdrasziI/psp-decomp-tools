@@ -33,7 +33,7 @@ TOOLS = str(project.TOOLS)
 DEFAULT_GHIDRA = os.environ.get("DECOMP_GHIDRA_INSTALL_DIR")
 DEFAULT_JDK = os.environ.get("DECOMP_GHIDRA_JDK")
 DEFAULT_PROJECT = os.environ.get("DECOMP_GHIDRA_PROJECT")
-PROJECT_NAME = project.ROOT.name.replace("-", "_")
+PROJECT_NAME = project.GHIDRA_PROJECT  # `ghidra_project` of decomp.toml, or the root folder's name
 
 
 def main():
