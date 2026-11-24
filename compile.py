@@ -20,11 +20,21 @@ A third-party source kept unmodified may hold functions the original link droppe
 object, with its relocations and the sections that only describe it. It needs a
 compiler that gives each function its own section (Metrowerks does).
 
+A GCC built with the Sony binutils 2.14 assembler of the PSP SDK 1.3.1 (`allegrex
+(mips2)`) cannot assemble the unaligned loads and stores `lwl`, `lwr`, `swl`, `swr`
+that GCC emits for copies of unaligned structures, though the Allegrex has them:
+`--unaligned-words` compiles to assembly (`-S`), writes each of them as its `.word`
+encoding, then assembles with the same compiler command. GCC only emits them inside
+`.set noreorder` / `.set nomacro`, where the assembler neither moves nor expands an
+instruction, so the bytes are the same; any other occurrence stops the build.
+
 usage: compile.py [--rename-section <old>=<new>]... [--drop-function <name>]...
-                  <objcopy> <out.o> <compiler command...>
-(the compiler command must write <out.o>)
+                  [--unaligned-words] <objcopy> <out.o> <compiler command...>
+(the compiler command must write <out.o>; with --unaligned-words it must be
+`<compiler> ... -c ... -o <out.o> ... <source>`, the source last)
 """
 
+import re
 import struct
 import os
 import subprocess
@@ -38,6 +48,58 @@ STT_FUNC = 2
 # (Metrowerks: one `.text` per function), so they are renamed one by one, by header,
 # and objcopy removes that name
 DROPPED = ".dropped"
+
+UNALIGNED_OPS = {"lwl": 0x22, "lwr": 0x26, "swl": 0x2A, "swr": 0x2E}
+GPR_NAMES = ["zero", "at", "v0", "v1", "a0", "a1", "a2", "a3", "t0", "t1", "t2", "t3", "t4",
+             "t5", "t6", "t7", "s0", "s1", "s2", "s3", "s4", "s5", "s6", "s7", "t8", "t9",
+             "k0", "k1", "gp", "sp", "fp", "ra"]
+GPRS = {f"${i}": i for i in range(32)} | {f"${n}": i for i, n in enumerate(GPR_NAMES)} | {"$s8": 30}
+UNALIGNED = re.compile(r"^(\s*)(lwl|lwr|swl|swr)\s+(\$\w+)\s*,\s*(-?\d+)\s*\(\s*(\$\w+)\s*\)\s*$")
+
+
+def unaligned_words(text: str, name: str) -> str:
+    """Write GCC's lwl/lwr/swl/swr as their `.word` encoding (module docstring)."""
+    noreorder = nomacro = False
+    out = []
+    for n, line in enumerate(text.splitlines(keepends=True), 1):
+        words = line.split()
+        if words and words[0] == ".set" and len(words) > 1:
+            noreorder = {"noreorder": True, "reorder": False}.get(words[1], noreorder)
+            nomacro = {"nomacro": True, "macro": False}.get(words[1], nomacro)
+        if not words or words[0] not in UNALIGNED_OPS:
+            out.append(line)
+            continue
+        m = UNALIGNED.match(line.rstrip("\r\n"))
+        if not m or m.group(3) not in GPRS or m.group(5) not in GPRS:
+            sys.exit(f"compile.py: {name}:{n}: unexpected form: {line.strip()}")
+        if not (noreorder and nomacro):
+            sys.exit(f"compile.py: {name}:{n}: {m.group(2)} outside .set noreorder/nomacro")
+        offset = int(m.group(4))
+        if not -0x8000 <= offset < 0x8000:
+            sys.exit(f"compile.py: {name}:{n}: offset out of range")
+        word = (UNALIGNED_OPS[m.group(2)] << 26 | GPRS[m.group(5)] << 21
+                | GPRS[m.group(3)] << 16 | offset & 0xFFFF)
+        out.append(f"{m.group(1)}.word\t0x{word:08x}\t# {line.strip()}\n")
+    return "".join(out)
+
+
+def compile_unaligned_words(command: list[str], out: Path) -> int:
+    """Compile to assembly, rewrite the unaligned accesses, assemble (module docstring)."""
+    if command.count("-c") != 1 or command.count("-o") != 1:
+        sys.exit("compile.py: --unaligned-words: the command needs one -c and one -o")
+    asm = out.with_name(out.name + ".s")
+    o = command.index("-o")
+    first = [a if a != "-c" else "-S" for a in command]
+    first[o + 1] = str(asm)
+    result = subprocess.run(first)
+    if result.returncode:
+        return result.returncode
+    try:
+        text = asm.read_text(encoding="utf-8")
+        asm.write_text(unaligned_words(text, str(asm)), encoding="utf-8", newline="\n")
+        return subprocess.run(command[:-1] + [str(asm)]).returncode
+    finally:
+        asm.unlink(missing_ok=True)
 
 
 def mark_dropped(path: Path, functions: list[str]) -> bool:
@@ -115,7 +177,12 @@ def main() -> None:
     argv = sys.argv[1:]
     renames = []
     dropped = []
-    while argv and argv[0] in ("--rename-section", "--drop-function"):
+    unaligned = False
+    while argv and argv[0] in ("--rename-section", "--drop-function", "--unaligned-words"):
+        if argv[0] == "--unaligned-words":
+            unaligned = True
+            argv = argv[1:]
+            continue
         if len(argv) < 2 or not argv[1]:
             sys.exit(f"compile.py: {argv[0]}: value missing")
         if argv[0] == "--drop-function":
@@ -131,9 +198,9 @@ def main() -> None:
     out.parent.mkdir(parents=True, exist_ok=True)
     # Windows CreateProcess does not find a relative path written with '/'
     command[0] = str(Path(command[0]).resolve())
-    result = subprocess.run(command)
-    if result.returncode:
-        sys.exit(result.returncode)
+    code = compile_unaligned_words(command, out) if unaligned else subprocess.run(command).returncode
+    if code:
+        sys.exit(code)
     try:
         args = [str(Path(objcopy).resolve()), "--wildcard", "--globalize-symbol=__sti__*"]
         if mark_dropped(out, dropped):

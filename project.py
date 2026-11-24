@@ -27,6 +27,8 @@ decomp.toml:
     #                                     # tools/common/linux_run.py (WSL on Windows)
     flags = "-O4"                         # code generation flags, no include paths
     rename_sections = [".rodata=.data"]   # optional: section renames in each object
+    unaligned_words = true                # optional: lwl/lwr/swl/swr as .word, for an
+                                          # assembler that refuses them (compile.py)
 
     [batch]                               # optional: batch_units.py
     splits = "notes/SPLITS.md"            # table of units to add rows to
