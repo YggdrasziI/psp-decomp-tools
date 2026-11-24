@@ -23,6 +23,8 @@ decomp.toml:
     [compiler]                            # optional: compiler of the C/C++ units
     name = "mwccpsp_3.0.1_219"            # tools/compilers/<name>/ (decomp.me archive)
     exe = "mwccpsp.exe"
+    # or: linux = "~/gcc/bin/psp-gcc"     # a Linux program (built from source): run by
+    #                                     # tools/common/linux_run.py (WSL on Windows)
     flags = "-O4"                         # code generation flags, no include paths
     rename_sections = [".rodata=.data"]   # optional: section renames in each object
 
@@ -107,12 +109,22 @@ def binutil(name: str) -> Path:
     return ROOT / "tools" / "binutils" / f"{BINUTILS_PREFIX}{name}{exe}"
 
 
+def linux_command(program: str) -> list[str]:
+    """Command that runs a Linux program here: itself on Linux, through WSL on Windows
+    (tools/common/linux_run.py). `~/` is the Linux home."""
+    if os.name == "nt":
+        return [sys.executable, str(ROOT / "tools" / "common" / "linux_run.py"), program]
+    return [os.path.expanduser(program)]
+
+
 def compiler() -> tuple[list[str], list[str]]:
     """([command], [flags]) of the [compiler] of decomp.toml, wibo first off Windows.
     The flags are the code generation ones; include paths are added by the caller."""
     cc = CONFIG.get("compiler")
     if not cc:
         sys.exit("decomp.toml: no [compiler] section")
+    if "linux" in cc:
+        return linux_command(cc["linux"]), cc.get("flags", "").split()
     exe = ROOT / "tools" / "compilers" / cc["name"] / cc["exe"]
     command = [str(exe)] if os.name == "nt" else [str(ROOT / "tools" / "wibo"), str(exe)]
     return command, cc.get("flags", "").split()
