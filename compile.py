@@ -24,9 +24,11 @@ A GCC built with the Sony binutils 2.14 assembler of the PSP SDK 1.3.1 (`allegre
 (mips2)`) cannot assemble the unaligned loads and stores `lwl`, `lwr`, `swl`, `swr`
 that GCC emits for copies of unaligned structures, though the Allegrex has them:
 `--unaligned-words` compiles to assembly (`-S`), writes each of them as its `.word`
-encoding, then assembles with the same compiler command. GCC only emits them inside
-`.set noreorder` / `.set nomacro`, where the assembler neither moves nor expands an
-instruction, so the bytes are the same; any other occurrence stops the build.
+encoding, then assembles with the same compiler command. The assembler expands none
+of them (a numeric offset that fits) and moves none of them inside `.set noreorder`;
+under `.set reorder` it only moves the instruction just before a branch or jump into
+its delay slot, which a `.word` would not fill: an unaligned access there, or any
+other form, stops the build. So the bytes are the same.
 
 usage: compile.py [--rename-section <old>=<new>]... [--drop-function <name>]...
                   [--unaligned-words] <objcopy> <out.o> <compiler command...>
@@ -57,23 +59,35 @@ GPRS = {f"${i}": i for i in range(32)} | {f"${n}": i for i, n in enumerate(GPR_N
 UNALIGNED = re.compile(r"^(\s*)(lwl|lwr|swl|swr)\s+(\$\w+)\s*,\s*(-?\d+)\s*\(\s*(\$\w+)\s*\)\s*$")
 
 
+def next_is_branch(lines: list[str]) -> bool:
+    """Whether the next instruction is a branch or jump (a label in between: no)."""
+    for line in lines:
+        s = line.split("#")[0].strip()
+        if not s or (s.startswith(".") and not s.endswith(":")):
+            continue
+        if s.endswith(":"):
+            return False
+        return s.split()[0].startswith(("b", "j"))
+    return False
+
+
 def unaligned_words(text: str, name: str) -> str:
     """Write GCC's lwl/lwr/swl/swr as their `.word` encoding (module docstring)."""
-    noreorder = nomacro = False
+    noreorder = False
     out = []
-    for n, line in enumerate(text.splitlines(keepends=True), 1):
+    lines = text.splitlines(keepends=True)
+    for n, line in enumerate(lines, 1):
         words = line.split()
         if words and words[0] == ".set" and len(words) > 1:
             noreorder = {"noreorder": True, "reorder": False}.get(words[1], noreorder)
-            nomacro = {"nomacro": True, "macro": False}.get(words[1], nomacro)
         if not words or words[0] not in UNALIGNED_OPS:
             out.append(line)
             continue
         m = UNALIGNED.match(line.rstrip("\r\n"))
         if not m or m.group(3) not in GPRS or m.group(5) not in GPRS:
             sys.exit(f"compile.py: {name}:{n}: unexpected form: {line.strip()}")
-        if not (noreorder and nomacro):
-            sys.exit(f"compile.py: {name}:{n}: {m.group(2)} outside .set noreorder/nomacro")
+        if not noreorder and next_is_branch(lines[n:]):
+            sys.exit(f"compile.py: {name}:{n}: {m.group(2)} before a branch under .set reorder")
         offset = int(m.group(4))
         if not -0x8000 <= offset < 0x8000:
             sys.exit(f"compile.py: {name}:{n}: offset out of range")
