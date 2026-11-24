@@ -49,11 +49,19 @@ def compiler_url(tag: str) -> str:
     return f"https://github.com/decompme/compilers/releases/download/compilers/{tag}.tar.gz"
 
 
+def pspdecrypt_url(tag: str) -> str:
+    # John-K/pspdecrypt (GPL-3.0), run by a project's extract script on an encrypted
+    # EBOOT.BIN; only downloaded, never copied into a repository
+    system = "macos" if platform.system == "darwin" else platform.system
+    return f"https://github.com/John-K/pspdecrypt/releases/download/{tag}/pspdecrypt-{tag}-{system}.zip"
+
+
 TOOLS = {
     "binutils": binutils_url,
     "compiler": compiler_url,
     "wibo": wibo_url,
     "objdiff": objdiff_url,
+    "pspdecrypt": pspdecrypt_url,
 }
 
 
@@ -64,6 +72,10 @@ response.raise_for_status()
 if download_url.endswith(".zip"):
     zip_file = zipfile.ZipFile(io.BytesIO(response.content))
     zip_file.extractall(args.path)
+    if args.tool == "pspdecrypt":
+        # zipfile drops the executable bit
+        for f in Path(args.path).glob("pspdecrypt*"):
+            f.chmod(f.stat().st_mode | stat.S_IEXEC)
 elif download_url.endswith(".tar.gz"):
     with tarfile.open(fileobj=io.BytesIO(response.content)) as tar:
         tar.extractall(args.path, filter="data")

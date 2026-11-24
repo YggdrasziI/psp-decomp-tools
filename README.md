@@ -61,7 +61,7 @@ Tools
 | `batch_units.py` | Decompile small functions in batches (m2c drafts, tail-call forwarders), keep the matching ones as units (`[batch]` in `decomp.toml`) |
 | `prototypes.py` | Check that the C sources give each function one argument count, no fewer than it reads, and no unprototyped declarations |
 | `ghidra_sync.py`, `ghidra/SyncSymbols.java` | Push the splat symbols to a Ghidra project (ghidra-allegrex) headless |
-| `download_tool.py`, `get_platform.py` | Build helpers |
+| `download_tool.py`, `get_platform.py` | Build helpers; `download_tool.py pspdecrypt <tag>` fetches the EBOOT decrypter for a project's extract script |
 | `nids.txt` | NID → function name, extracted from PPSSPP's HLE tables (`prx_symbols.py --ppsspp`) |
 | `probes/` | Compiler probe sources |
 
@@ -75,4 +75,6 @@ Provenance
 - `vfpu_words.py` follows the idea of sotn-decomp's `tools/pspas` (AGPL-3.0), written
   from scratch; the HI16/LO16 pairing of `prx_reloc.py` follows the behaviour of
   PPSSPP's `ElfReader::LoadRelocations`, written from scratch.
+- [pspdecrypt](https://github.com/John-K/pspdecrypt) (GPL-3.0) is only downloaded by
+  `download_tool.py` and run as a program; none of its code is in this repository.
 - Everything else is original work released under CC0-1.0 (`LICENSE`).
