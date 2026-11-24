@@ -33,9 +33,12 @@ def s16(value: int) -> int:
 def shift_segment_refs(prx: Prx, delta: int, segment: int = 1) -> bytes:
     """Return the PRX bytes with `delta` added to every reference to `segment`."""
     data = bytearray(prx.data)
-    file_base = [seg.offset - seg.vaddr for seg in prx.segments]
+    # A relocation offset is relative to the start of its segment (PPSSPP adds
+    # segmentVAddr[offsetSeg]), so its file position is that segment's offset plus it
+    file_base = [seg.offset for seg in prx.segments]
 
-    for name in {r.section for r in prx.relocs()}:
+    # Tables in file order, as the loader walks them (a set gave a hash-dependent order)
+    for name in dict.fromkeys(r.section for r in prx.relocs()):
         table = [r for r in prx.relocs() if r.section == name]
         # Words before patching, as the loader reads them first
         words = [struct.unpack_from("<I", data, file_base[r.offset_seg] + r.offset)[0]
