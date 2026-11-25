@@ -57,6 +57,9 @@ Tools
 | `compile.py` | Run a compiler, then drop empty allocated sections |
 | `lmgr_patch.py` | Let Metrowerks compilers run natively on Windows (FLEXlm checkout stubbed, as wibo does); applied by `download_tool.py` |
 | `compiler_probe.py` | Compile a probe file and compare its `func_XXXXXXXX` functions with the original |
+| `find_functions.py`, `library_sweep.py` | Find the functions of a compiled object in the original by content; compile a whole library directory and count the identical functions (score of a compiler, flag set or source revision) |
+| `gcc_sched_scan.py`, `gcc_sched_build.sh` | Find a retail GCC's instruction latencies: one compiler per variant of the scheduling description, each scored with `library_sweep.py` |
+| `gcc_rtl_trace.py` | Scheduler trace, register dispositions or any RTL pass dump of one function (GCC) |
 | `unit_candidates.py`, `tu_ends.py` | Find the next functions to decompile and translation-unit ends |
 | `batch_units.py` | Decompile small functions in batches (m2c drafts, tail-call forwarders), keep the matching ones as units (`[batch]` in `decomp.toml`) |
 | `prototypes.py` | Check that the C sources give each function one argument count, no fewer than it reads, and no unprototyped declarations |
