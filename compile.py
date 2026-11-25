@@ -40,8 +40,18 @@ under `.set reorder` it only moves the instruction just before a branch or jump 
 its delay slot, which a `.word` would not fill: an unaligned access there, or any
 other form, stops the build. So the bytes are the same.
 
+GCC describes a function of a `.gnu.linkonce.t.<name>` section in `.eh_frame` with a
+relocation against the section itself. When the link keeps another object's copy of
+the function, GNU ld writes 0 there; the linker of a game whose `.eh_frame` entries of
+the discarded copies hold the kept copy's address used the kept section instead.
+`--linkonce-symbols` gives the same bytes: each `R_MIPS_32` against the section
+symbol of a `.gnu.linkonce.t.<name>` section, from another section, is made a
+relocation against the global or weak symbol `<name>` when that symbol is defined at
+the start of the section, so the link resolves it to the copy it keeps.
+
 usage: compile.py [--rename-section <old>=<new>[,<flags>]]... [--drop-function <name>]...
-                  [--unaligned-words] [--cwd <dir>] <objcopy> <out.o> <compiler command...>
+                  [--unaligned-words] [--linkonce-symbols] [--cwd <dir>]
+                  <objcopy> <out.o> <compiler command...>
 (the compiler command must write <out.o>; with --unaligned-words it must be
 `<compiler> ... -c ... -o <out.o> ... <source>`, the source last)
 """
@@ -55,7 +65,9 @@ from pathlib import Path
 
 SHF_ALLOC = 0x2
 SHT_SYMTAB, SHT_REL = 2, 9
-STT_FUNC = 2
+STT_FUNC, STT_SECTION = 2, 3
+STB_GLOBAL, STB_WEAK = 1, 2
+R_MIPS_32 = 2
 # suffix of the sections to remove: several sections of an object can share a name
 # (Metrowerks: one `.text` per function), so they are renamed one by one, by header,
 # and objcopy removes that name
@@ -211,6 +223,43 @@ def mark_dropped(path: Path, functions: list[str]) -> bool:
     return True
 
 
+def linkonce_symbols(path: Path) -> None:
+    """Retarget the data relocations against `.gnu.linkonce.t.<name>` section symbols
+    at the symbol `<name>` (module docstring)."""
+    d = bytearray(path.read_bytes())
+    shoff, = struct.unpack_from("<I", d, 0x20)
+    shentsize, shnum, shstrndx = struct.unpack_from("<HHH", d, 0x2E)
+    headers = [struct.unpack_from("<10I", d, shoff + i * shentsize) for i in range(shnum)]
+
+    def string(table: int, offset: int) -> str:
+        start = headers[table][4] + offset
+        return d[start:d.index(b"\0", start)].decode()
+
+    symtab = next(i for i, h in enumerate(headers) if h[1] == SHT_SYMTAB)
+    symbols = [struct.unpack_from("<IIIBBH", d, headers[symtab][4] + k * 16)
+               for k in range(headers[symtab][5] // 16)]
+    prefix = ".gnu.linkonce.t."
+    named = {}  # linkonce section -> index of the global or weak symbol it is named after
+    for k, (name, value, _size, info, _other, shndx) in enumerate(symbols):
+        if info >> 4 not in (STB_GLOBAL, STB_WEAK) or value or not 0 < shndx < shnum:
+            continue
+        if string(shstrndx, headers[shndx][0]) == prefix + string(headers[symtab][6], name):
+            named[shndx] = k
+    changed = False
+    for h in headers:
+        if h[1] != SHT_REL:
+            continue
+        for k in range(h[5] // 8):
+            _offset, info = struct.unpack_from("<II", d, h[4] + k * 8)
+            symbol = symbols[info >> 8]
+            section = symbol[5]
+            if info & 0xFF == R_MIPS_32 and symbol[3] & 0xF == STT_SECTION and section in named and section != h[7]:
+                struct.pack_into("<I", d, h[4] + k * 8 + 4, named[section] << 8 | R_MIPS_32)
+                changed = True
+    if changed:
+        path.write_bytes(d)
+
+
 def main() -> None:
     # Metrowerks drivers warn and stop without it; includes come from -I flags
     os.environ.setdefault("MWCIncludes", ".")
@@ -218,10 +267,13 @@ def main() -> None:
     renames = []
     dropped = []
     unaligned = False
+    linkonce = False
     cwd = None
-    while argv and argv[0] in ("--rename-section", "--drop-function", "--unaligned-words", "--cwd"):
-        if argv[0] == "--unaligned-words":
-            unaligned = True
+    while argv and argv[0] in ("--rename-section", "--drop-function", "--unaligned-words",
+                               "--linkonce-symbols", "--cwd"):
+        if argv[0] in ("--unaligned-words", "--linkonce-symbols"):
+            unaligned = unaligned or argv[0] == "--unaligned-words"
+            linkonce = linkonce or argv[0] == "--linkonce-symbols"
             argv = argv[1:]
             continue
         if len(argv) < 2 or not argv[1]:
@@ -251,6 +303,8 @@ def main() -> None:
     if code:
         sys.exit(code)
     try:
+        if linkonce:
+            linkonce_symbols(out)
         args = [str(Path(objcopy).resolve()), "--wildcard", "--globalize-symbol=__sti__*"]
         if mark_dropped(out, dropped):
             args += ["--remove-section", f"*{DROPPED}"]
