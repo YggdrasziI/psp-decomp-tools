@@ -45,7 +45,11 @@ encoding, then assembles with the same compiler command. The assembler expands n
 of them (a numeric offset that fits) and moves none of them inside `.set noreorder`;
 under `.set reorder` it only moves the instruction just before a branch or jump into
 its delay slot, which a `.word` would not fill: an unaligned access there, or any
-other form, stops the build. So the bytes are the same.
+other form, stops the build. So the bytes are the same. An offset that is a
+relocation (`lwr $6,%lo(sym)($3)`, a copy of a constant string) cannot be a `.word`:
+it is assembled as the aligned access of the same form (`lw`/`sw`, same relocation)
+after a label `__compile_py_unaligned_<op>_<n>`, and the opcode of the word at each
+such label is set back to `<op>` in the object before objcopy removes the labels.
 
 GCC describes a function of a `.gnu.linkonce.t.<name>` section in `.eh_frame` with a
 relocation against the section itself. When the link keeps another object's copy of
@@ -86,6 +90,10 @@ GPR_NAMES = ["zero", "at", "v0", "v1", "a0", "a1", "a2", "a3", "t0", "t1", "t2",
              "k0", "k1", "gp", "sp", "fp", "ra"]
 GPRS = {f"${i}": i for i in range(32)} | {f"${n}": i for i, n in enumerate(GPR_NAMES)} | {"$s8": 30}
 UNALIGNED = re.compile(r"^(\s*)(lwl|lwr|swl|swr)\s+(\$\w+)\s*,\s*(-?\d+)\s*\(\s*(\$\w+)\s*\)\s*$")
+UNALIGNED_RELOC = re.compile(r"^(\s*)(lwl|lwr|swl|swr)\s+(\$\w+)\s*,\s*(%lo\([^()]*\)(?:[+-]\d+)?)"
+                             r"\s*\(\s*(\$\w+)\s*\)\s*$")
+ALIGNED_OF = {"lwl": "lw", "lwr": "lw", "swl": "sw", "swr": "sw"}
+UNALIGNED_LABEL = "__compile_py_unaligned_"
 
 
 def next_is_branch(lines: list[str]) -> bool:
@@ -112,11 +120,17 @@ def unaligned_words(text: str, name: str) -> str:
         if not words or words[0] not in UNALIGNED_OPS:
             out.append(line)
             continue
-        m = UNALIGNED.match(line.rstrip("\r\n"))
+        m = UNALIGNED.match(line.rstrip("\r\n")) or UNALIGNED_RELOC.match(line.rstrip("\r\n"))
         if not m or m.group(3) not in GPRS or m.group(5) not in GPRS:
             sys.exit(f"compile.py: {name}:{n}: unexpected form: {line.strip()}")
         if not noreorder and next_is_branch(lines[n:]):
             sys.exit(f"compile.py: {name}:{n}: {m.group(2)} before a branch under .set reorder")
+        if m.re is UNALIGNED_RELOC:
+            # assembled aligned, opcode set back in the object (module docstring)
+            out.append(f"{UNALIGNED_LABEL}{m.group(2)}_{n}:\n"
+                       f"{m.group(1)}{ALIGNED_OF[m.group(2)]}\t{m.group(3)},{m.group(4)}({m.group(5)})"
+                       f"\t# {line.strip()}\n")
+            continue
         offset = int(m.group(4))
         if not -0x8000 <= offset < 0x8000:
             sys.exit(f"compile.py: {name}:{n}: offset out of range")
@@ -124,6 +138,31 @@ def unaligned_words(text: str, name: str) -> str:
                 | GPRS[m.group(3)] << 16 | offset & 0xFFFF)
         out.append(f"{m.group(1)}.word\t0x{word:08x}\t# {line.strip()}\n")
     return "".join(out)
+
+
+def restore_unaligned(path: Path) -> bool:
+    """Set the opcode of the word at each `__compile_py_unaligned_<op>_<n>` label back
+    to `<op>` (module docstring); False if the object has no such label."""
+    d = bytearray(path.read_bytes())
+    shoff, = struct.unpack_from("<I", d, 0x20)
+    shentsize, shnum, _shstrndx = struct.unpack_from("<HHH", d, 0x2E)
+    headers = [struct.unpack_from("<10I", d, shoff + i * shentsize) for i in range(shnum)]
+    symtab = next(i for i, h in enumerate(headers) if h[1] == SHT_SYMTAB)
+    strtab = headers[headers[symtab][6]][4]
+    found = False
+    for k in range(headers[symtab][5] // 16):
+        name, value, _size, _info, _other, shndx = struct.unpack_from("<IIIBBH", d, headers[symtab][4] + k * 16)
+        name = d[strtab + name:d.index(b"\0", strtab + name)].decode()
+        if not name.startswith(UNALIGNED_LABEL):
+            continue
+        op = name[len(UNALIGNED_LABEL):].split("_")[0]
+        at = headers[shndx][4] + value
+        word, = struct.unpack_from("<I", d, at)
+        struct.pack_into("<I", d, at, UNALIGNED_OPS[op] << 26 | word & 0x03FFFFFF)
+        found = True
+    if found:
+        path.write_bytes(d)
+    return found
 
 
 def in_dir(command: list[str], out: Path, cwd: Path) -> list[str]:
@@ -350,6 +389,8 @@ def main() -> None:
         if linkonce:
             linkonce_symbols(out)
         args = [str(Path(objcopy).resolve()), "--wildcard", "--globalize-symbol=__sti__*"]
+        if unaligned and restore_unaligned(out):
+            args.append(f"--strip-symbol={UNALIGNED_LABEL}*")
         if mark_dropped(out, dropped):
             args += ["--remove-section", f"*{DROPPED}"]
         for rename in renames:
