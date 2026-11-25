@@ -13,7 +13,17 @@ symbol_addrs.txt): it is made global.
 A game whose link merged the read-only data into `.data` (no `.rodata` in the
 image) needs the same in each unit before its data can sit at its own place in the
 linker script: `--rename-section .rodata=.data` renames every section of that name
-(switch jump tables, constants) and makes it writable data.
+(switch jump tables, constants) and makes it writable data. Flags after the new
+name (`--rename-section <old>=<new>,<flags>`, objcopy's) replace those: the same name
+with `alloc,load,readonly,data,contents` keeps a section where it is but drops its
+merge flag, for a link that did not merge constants and strings
+(`.rodata.cst4`, `.rodata.str1.4`) where GNU ld would.
+
+A file compiled in another directory than the build's (its `__FILE__` strings and
+include paths as the original build had them): `--cwd <dir>` runs the compiler there.
+An argument naming an existing path under `<dir>` (the source) is given relative to
+it, any other existing path (the compiler, a script) absolute, `<out.o>` absolute;
+flags are passed as they are, so their paths must be relative to `<dir>`.
 
 A third-party source kept unmodified may hold functions the original link dropped
 (unused ones): `--drop-function <name>` removes the function's own section from the
@@ -30,8 +40,8 @@ under `.set reorder` it only moves the instruction just before a branch or jump 
 its delay slot, which a `.word` would not fill: an unaligned access there, or any
 other form, stops the build. So the bytes are the same.
 
-usage: compile.py [--rename-section <old>=<new>]... [--drop-function <name>]...
-                  [--unaligned-words] <objcopy> <out.o> <compiler command...>
+usage: compile.py [--rename-section <old>=<new>[,<flags>]]... [--drop-function <name>]...
+                  [--unaligned-words] [--cwd <dir>] <objcopy> <out.o> <compiler command...>
 (the compiler command must write <out.o>; with --unaligned-words it must be
 `<compiler> ... -c ... -o <out.o> ... <source>`, the source last)
 """
@@ -97,7 +107,23 @@ def unaligned_words(text: str, name: str) -> str:
     return "".join(out)
 
 
-def compile_unaligned_words(command: list[str], out: Path) -> int:
+def in_dir(command: list[str], out: Path, cwd: Path) -> list[str]:
+    """The command's paths for a compiler run in `cwd` (module docstring)."""
+    base = cwd.resolve()
+    result = []
+    for arg in command:
+        path = Path(arg)
+        if path == out:
+            result.append(str(out.resolve()))
+        elif not arg.startswith("-") and path.exists():
+            full = path.resolve()
+            result.append(full.relative_to(base).as_posix() if full.is_relative_to(base) else str(full))
+        else:
+            result.append(arg)
+    return result
+
+
+def compile_unaligned_words(command: list[str], out: Path, cwd: Path | None = None) -> int:
     """Compile to assembly, rewrite the unaligned accesses, assemble (module docstring)."""
     if command.count("-c") != 1 or command.count("-o") != 1:
         sys.exit("compile.py: --unaligned-words: the command needs one -c and one -o")
@@ -105,13 +131,13 @@ def compile_unaligned_words(command: list[str], out: Path) -> int:
     o = command.index("-o")
     first = [a if a != "-c" else "-S" for a in command]
     first[o + 1] = str(asm)
-    result = subprocess.run(first)
+    result = subprocess.run(first, cwd=cwd)
     if result.returncode:
         return result.returncode
     try:
         text = asm.read_text(encoding="utf-8")
         asm.write_text(unaligned_words(text, str(asm)), encoding="utf-8", newline="\n")
-        return subprocess.run(command[:-1] + [str(asm)]).returncode
+        return subprocess.run(command[:-1] + [str(asm)], cwd=cwd).returncode
     finally:
         asm.unlink(missing_ok=True)
 
@@ -192,7 +218,8 @@ def main() -> None:
     renames = []
     dropped = []
     unaligned = False
-    while argv and argv[0] in ("--rename-section", "--drop-function", "--unaligned-words"):
+    cwd = None
+    while argv and argv[0] in ("--rename-section", "--drop-function", "--unaligned-words", "--cwd"):
         if argv[0] == "--unaligned-words":
             unaligned = True
             argv = argv[1:]
@@ -201,6 +228,10 @@ def main() -> None:
             sys.exit(f"compile.py: {argv[0]}: value missing")
         if argv[0] == "--drop-function":
             dropped.append(argv[1])
+        elif argv[0] == "--cwd":
+            cwd = Path(argv[1])
+            if not cwd.is_dir():
+                sys.exit(f"compile.py: --cwd {argv[1]}: not a directory")
         elif "=" not in argv[1]:
             sys.exit(f"compile.py: --rename-section {argv[1]}: expected <old>=<new>")
         else:
@@ -212,7 +243,11 @@ def main() -> None:
     out.parent.mkdir(parents=True, exist_ok=True)
     # Windows CreateProcess does not find a relative path written with '/'
     command[0] = str(Path(command[0]).resolve())
-    code = compile_unaligned_words(command, out) if unaligned else subprocess.run(command).returncode
+    if cwd:
+        out = out.resolve()
+        command = in_dir(command, Path(argv[1]), cwd)
+    code = (compile_unaligned_words(command, out, cwd) if unaligned
+            else subprocess.run(command, cwd=cwd).returncode)
     if code:
         sys.exit(code)
     try:
@@ -221,7 +256,7 @@ def main() -> None:
             args += ["--remove-section", f"*{DROPPED}"]
         for rename in renames:
             # an empty section of the old name is removed above, not renamed
-            args += ["--rename-section", f"{rename},alloc,load,data,contents"]
+            args += ["--rename-section", rename if "," in rename else f"{rename},alloc,load,data,contents"]
         subprocess.run(args + [str(out)], check=True)
     except BaseException:
         # never leave the compiler's raw object behind as an up-to-date output
