@@ -54,10 +54,10 @@ Tools
 | `prx_reloc.py` | Move PRX segment-relative references to absolute form and back (splat, then the build) |
 | `reloc_overrides.py` | `MIPS_NONE` overrides for constants spimdisasm mistook for addresses (PRX only) |
 | `vfpu_words.py`, `assemble.py` | Assemble splat output with GNU as: VFPU and Allegrex-only instructions become `.word` |
-| `compile.py` | Run a compiler, then drop empty allocated sections |
+| `compile.py` | Run a compiler, then drop empty allocated sections; `--depfile`: header dependencies for ninja (GCC `-MD`), also for a compiler run in another directory or under WSL |
 | `lmgr_patch.py` | Let Metrowerks compilers run natively on Windows (FLEXlm checkout stubbed, as wibo does); applied by `download_tool.py` |
 | `compiler_probe.py` | Compile a probe file and compare its `func_XXXXXXXX` functions with the original |
-| `find_functions.py`, `library_sweep.py` | Find the functions of a compiled object in the original by content; compile a whole library directory and count the identical functions (score of a compiler, flag set or source revision) |
+| `find_functions.py`, `library_sweep.py` | Find the functions of a compiled object in the original by content; compile a whole library directory and count the identical functions (score of a compiler, flag set or source revision); `--inline <lo> <hi>` also scores the inline functions and template instances (`.gnu.linkonce.t.*`) |
 | `gcc_sched_scan.py`, `gcc_sched_build.sh` | Find a retail GCC's instruction latencies: one compiler per variant of the scheduling description, each scored with `library_sweep.py` |
 | `gcc_rtl_trace.py` | Scheduler trace, register dispositions or any RTL pass dump of one function (GCC) |
 | `unit_candidates.py`, `tu_ends.py` | Find the next functions to decompile and translation-unit ends |

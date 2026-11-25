@@ -25,6 +25,13 @@ An argument naming an existing path under `<dir>` (the source) is given relative
 it, any other existing path (the compiler, a script) absolute, `<out.o>` absolute;
 flags are passed as they are, so their paths must be relative to `<dir>`.
 
+Header dependencies, for a GCC-compatible compiler: `--depfile <file>` adds `-MD -MF`
+to the compilation and writes `<file>` in the form ninja reads (`depfile = $out.d`,
+`deps = gcc`): the headers the source includes, as paths relative to the build's
+directory wherever the compiler ran (`--cwd`, a Linux compiler under WSL: `/mnt/<x>/`
+becomes `<X>:/`). Headers that do not exist on this machine (the compiler's own, in
+its Linux install) are left out.
+
 A third-party source kept unmodified may hold functions the original link dropped
 (unused ones): `--drop-function <name>` removes the function's own section from the
 object, with its relocations and the sections that only describe it. It needs a
@@ -133,6 +140,30 @@ def in_dir(command: list[str], out: Path, cwd: Path) -> list[str]:
         else:
             result.append(arg)
     return result
+
+
+def write_depfile(raw: Path, depfile: Path, target: str, cwd: Path | None) -> None:
+    """Turn the compiler's dependency file into ninja's (module docstring)."""
+    text = raw.read_text(encoding="utf-8", errors="replace").replace("\\\n", " ")
+    raw.unlink(missing_ok=True)
+    names = re.findall(r"(?:[^\s\\]|\\.)+", text.partition(": ")[2])
+    root = Path.cwd().resolve()
+    base = (cwd or root).resolve()
+    deps = []
+    for name in names:
+        name = name.replace("\\ ", " ")
+        if m := re.match(r"^/mnt/([a-z])/(.*)$", name):
+            path = Path(f"{m.group(1).upper()}:/{m.group(2)}")
+        else:
+            path = Path(name) if Path(name).is_absolute() else base / name
+        if not path.exists():
+            continue
+        path = path.resolve()
+        shown = path.relative_to(root).as_posix() if path.is_relative_to(root) else path.as_posix()
+        if shown not in deps:
+            deps.append(shown)
+    depfile.write_text(target + ": " + " ".join(d.replace(" ", "\\ ") for d in deps) + "\n",
+                       encoding="utf-8", newline="\n")
 
 
 def compile_unaligned_words(command: list[str], out: Path, cwd: Path | None = None) -> int:
@@ -269,8 +300,9 @@ def main() -> None:
     unaligned = False
     linkonce = False
     cwd = None
+    depfile = None
     while argv and argv[0] in ("--rename-section", "--drop-function", "--unaligned-words",
-                               "--linkonce-symbols", "--cwd"):
+                               "--linkonce-symbols", "--cwd", "--depfile"):
         if argv[0] in ("--unaligned-words", "--linkonce-symbols"):
             unaligned = unaligned or argv[0] == "--unaligned-words"
             linkonce = linkonce or argv[0] == "--linkonce-symbols"
@@ -280,6 +312,8 @@ def main() -> None:
             sys.exit(f"compile.py: {argv[0]}: value missing")
         if argv[0] == "--drop-function":
             dropped.append(argv[1])
+        elif argv[0] == "--depfile":
+            depfile = Path(argv[1]).resolve()
         elif argv[0] == "--cwd":
             cwd = Path(argv[1])
             if not cwd.is_dir():
@@ -298,10 +332,20 @@ def main() -> None:
     if cwd:
         out = out.resolve()
         command = in_dir(command, Path(argv[1]), cwd)
+    if depfile:
+        # with -c (the command may start with a runner and the compiler's path); the
+        # first step of --unaligned-words keeps every flag
+        if "-c" not in command:
+            sys.exit("compile.py: --depfile: the command needs -c")
+        raw = depfile.with_name(depfile.name + ".raw")
+        at = command.index("-c")
+        command[at:at] = ["-MD", "-MF", str(raw)]
     code = (compile_unaligned_words(command, out, cwd) if unaligned
             else subprocess.run(command, cwd=cwd).returncode)
     if code:
         sys.exit(code)
+    if depfile:
+        write_depfile(raw, depfile, Path(argv[1]).as_posix(), cwd)
     try:
         if linkonce:
             linkonce_symbols(out)
