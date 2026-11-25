@@ -15,9 +15,13 @@ Writes `<out>/<file>.o`, `<out>/<file>.ff` (find_functions.py output) and
 did not compile. With `--base <identical.txt of another run>`: the functions gained
 and lost against it.
 
-usage: library_sweep.py <dir> <lo> <hi> --out <folder> [--cc <compiler>] [--flags "..."]
-                        [--base <identical.txt>] [--only a,b] [--jobs N] [--version ID]
-                        [--module M]
+`--inline <lo> <hi>` also scores the inline functions and template instances each
+object carries (find_functions.py): give it for any change of compiler, since a file
+already linked from source needs them identical too.
+
+usage: library_sweep.py <dir> <lo> <hi> --out <folder> [--inline <lo> <hi>] [--cc <compiler>]
+                        [--flags "..."] [--base <identical.txt>] [--only a,b] [--jobs N]
+                        [--version ID] [--module M]
 """
 
 import argparse
@@ -40,6 +44,7 @@ def main() -> None:
     parser.add_argument("lo")
     parser.add_argument("hi")
     parser.add_argument("--out", type=Path, required=True)
+    parser.add_argument("--inline", nargs=2, metavar=("LO", "HI"))
     parser.add_argument("--cc")
     parser.add_argument("--flags")
     parser.add_argument("--base", type=Path)
@@ -78,6 +83,7 @@ def main() -> None:
         if not obj.exists():
             return source.stem, None, ((r.stderr + r.stdout).strip().splitlines() or ["?"])[-1][:150]
         found = subprocess.run([sys.executable, str(TOOLS / "find_functions.py"), str(obj), args.lo, args.hi,
+                                *(["--inline", *args.inline] if args.inline else []),
                                 "--version", args.version, "--module", args.module],
                                cwd=project.ROOT, capture_output=True, text=True).stdout
         (out / (source.stem + ".ff")).write_text(found, encoding="utf-8")

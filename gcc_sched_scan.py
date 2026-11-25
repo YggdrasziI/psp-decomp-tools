@@ -27,7 +27,8 @@ the reference compiler (library_sweep.py). Results in `<out>/<tag>/`.
 usage: gcc_sched_scan.py --work <built GCC work tree> --md <description path in it>
                          --base-md <description file to extend> --installed <compiler folder>
                          --dir <library dir> --range <lo> <hi> --out <folder>
-                         [--base-run <identical.txt>] [--cpu allegrex] [--parallel 6]
+                         [--inline <lo> <hi>] [--base-run <identical.txt>] [--cpu allegrex]
+                         [--parallel 6]
                          [--cc-path bin/psp-gcc] <tag>:<specs>...
 (--work, --installed: Linux paths, `~/` allowed)
 """
@@ -70,6 +71,7 @@ def main() -> None:
     parser.add_argument("--dir", required=True)
     parser.add_argument("--range", nargs=2, required=True, metavar=("LO", "HI"))
     parser.add_argument("--out", type=Path, required=True)
+    parser.add_argument("--inline", nargs=2, metavar=("LO", "HI"), help="as library_sweep.py")
     parser.add_argument("--base-run", type=Path)
     parser.add_argument("--cpu", default="allegrex")
     parser.add_argument("--parallel", type=int, default=6)
@@ -102,6 +104,8 @@ def main() -> None:
                 continue
             command = [sys.executable, str(TOOLS / "library_sweep.py"), args.dir, *args.range,
                        "--out", str(out / tag), "--cc", f"{installed}-{tag}/{args.cc_path}"]
+            if args.inline:
+                command += ["--inline", *args.inline]
             if args.base_run:
                 command += ["--base", str(args.base_run)]
             r = subprocess.run(command, cwd=project.ROOT, capture_output=True, text=True)
