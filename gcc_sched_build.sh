@@ -5,7 +5,7 @@
 #   gcc_sched_build.sh <work tree> <md path in it> <installed compiler> <new install> <md file> <slot>
 #
 # <work tree>: a configured and built GCC (source and build folders), e.g. the one a
-#   toolchain kit leaves; copied once to <work tree>-sched<slot>, so several builds
+#   toolchain kit leaves; copied to <work tree>-sched<slot>, so several builds
 #   run side by side. <md path in it>: the description to replace, e.g.
 #   gcc-4.0.4/gcc/config/mips/allegrex-sched.md; the build folder is <work tree>/build.
 # <installed compiler>: copied to <new install>, which then gets the two programs.
@@ -15,7 +15,10 @@ set -eu
 home() { case "$1" in "~/"*) echo "$HOME/${1#\~/}" ;; *) echo "$1" ;; esac; }
 work=$(home "$1"); md=$2; installed=$(home "$3"); new=$(home "$4"); file=$5; slot=$6
 tree=$work-sched$slot
-[ -d "$tree" ] || cp -a "$work" "$tree"
+# the copy follows the work tree (a source change there, e.g. another patch, must
+# reach every slot): rsync brings it up to date, cp only makes the first copy
+if command -v rsync > /dev/null; then mkdir -p "$tree"; rsync -a "$work/" "$tree/"
+else [ -d "$tree" ] || cp -a "$work" "$tree"; fi
 cp "$file" "$tree/$md"
 flags=${HOST_CFLAGS:--O1 -g0 -std=gnu89 -fcommon -fpermissive -w -U_FORTIFY_SOURCE -D_FORTIFY_SOURCE=0}
 (cd "$tree/build/gcc" && make -j"${JOBS:-4}" cc1 cc1plus MAKEINFO=true CFLAGS="$flags" > ../make-sched.log 2>&1) \
